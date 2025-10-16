@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.cursor/
+.agent-tools/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+*.log
+build/
+dist/
+*.egg-info/
+
