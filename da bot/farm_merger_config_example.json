@@ -1,0 +1,53 @@
+{
+  "version": "2.0",
+  "screen_area": [],
+  "resize_factor": 1.0,
+  "merge_count": 3,
+  "merging_points": [],
+  "stop_hotkey": ["="],
+  "box_button_point": [],
+  "box_amount": 0,
+  "drag_duration_seconds": 0.3,
+  "regions": {
+    "order_board": [],
+    "energy_display": [],
+    "coin_display": [],
+    "producer_area": []
+  },
+  "automation": {
+    "collect_resources": true,
+    "fulfill_orders": true,
+    "auto_merge": true,
+    "handle_popups": true,
+    "expand_land": false,
+    "repair_buildings": true,
+    "participate_in_events": true,
+    "energy_threshold": 20,
+    "max_coins_per_expansion": 5000,
+    "max_coins_per_session": 10000,
+    "order_priority": "coins",
+    "merge_priority": "balanced"
+  },
+  "timing": {
+    "scan_interval_resources": 30,
+    "scan_interval_orders": 60,
+    "scan_interval_events": 300,
+    "merge_delay": 0.05,
+    "click_delay": 0.5
+  },
+  "safety": {
+    "max_actions_per_minute": 60,
+    "randomize_delays": true,
+    "humanlike_mouse": true,
+    "pause_on_manual_input": true
+  },
+  "active_profile": "balanced",
+  "telemetry": {
+    "enabled": true,
+    "log_directory": "./logs",
+    "save_session_on_exit": true
+  }
+}
+
+
+

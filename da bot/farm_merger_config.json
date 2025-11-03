@@ -1,0 +1,75 @@
+{
+    "merge_count": 5,
+    "area": [
+        1279,
+        106,
+        2559,
+        1365
+    ],
+    "hotkey": [
+        "="
+    ],
+    "stop_hotkey": [
+        "space"
+    ],
+    "merging_points": [
+        [
+            1646,
+            862
+        ],
+        [
+            1703,
+            890
+        ],
+        [
+            1814,
+            942
+        ],
+        [
+            1754,
+            913
+        ]
+    ],
+    "resize_factor": 1.5,
+    "drag_duration_seconds": 0.2500000298023224,
+    "box_button_point": [
+        1924,
+        1267
+    ],
+    "box_amount": 0,
+    "box_counter_region": [
+        1882,
+        1299,
+        74,
+        36
+    ],
+    "resource_regions": {
+        "coins": [
+            2174,
+            134,
+            65,
+            28
+        ],
+        "gems": [
+            2316,
+            137,
+            52,
+            26
+        ],
+        "thunder": [
+            2447,
+            136,
+            36,
+            28
+        ]
+    },
+    "advanced_settings": {
+        "board_rows": 20,
+        "board_cols": 20,
+        "disallowed_slots": [
+            "0-0"
+        ],
+        "slot_overrides": {},
+        "auto_board_detection": true
+    }
+}

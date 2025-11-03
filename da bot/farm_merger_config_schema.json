@@ -1,0 +1,302 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Farm Merger Configuration Schema",
+  "description": "Complete configuration schema for Farm Merge Valley automation",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Config version",
+      "default": "2.0"
+    },
+    "screen_area": {
+      "type": "array",
+      "description": "Main game board screen region [x, y, width, height]",
+      "items": {
+        "type": "integer"
+      },
+      "minItems": 4,
+      "maxItems": 4,
+      "default": []
+    },
+    "resize_factor": {
+      "type": "number",
+      "description": "Template scaling factor",
+      "minimum": 0.1,
+      "maximum": 2.0,
+      "default": 1.0
+    },
+    "merge_count": {
+      "type": "integer",
+      "description": "Number of items to merge at once",
+      "minimum": 2,
+      "maximum": 10,
+      "default": 3
+    },
+    "merging_points": {
+      "type": "array",
+      "description": "Target positions for merging [x, y]",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "integer"
+        },
+        "minItems": 2,
+        "maxItems": 2
+      },
+      "default": []
+    },
+    "stop_hotkey": {
+      "type": "array",
+      "description": "Hotkey combination to stop automation",
+      "items": {
+        "type": "string"
+      },
+      "default": ["="]
+    },
+    "box_button_point": {
+      "type": "array",
+      "description": "Position of box/chest button [x, y]",
+      "items": {
+        "type": "integer"
+      },
+      "minItems": 2,
+      "maxItems": 2,
+      "default": []
+    },
+    "box_amount": {
+      "type": "integer",
+      "description": "Number of boxes available",
+      "minimum": 0,
+      "default": 0
+    },
+    "drag_duration_seconds": {
+      "type": "number",
+      "description": "Duration of drag operations in seconds",
+      "minimum": 0.01,
+      "maximum": 5.0,
+      "default": 0.3
+    },
+    "regions": {
+      "type": "object",
+      "description": "Screen regions for various game elements",
+      "properties": {
+        "order_board": {
+          "type": "array",
+          "description": "Order board region [x, y, width, height]",
+          "items": {
+            "type": "integer"
+          },
+          "minItems": 4,
+          "maxItems": 4,
+          "default": []
+        },
+        "energy_display": {
+          "type": "array",
+          "description": "Energy counter region [x, y, width, height]",
+          "items": {
+            "type": "integer"
+          },
+          "minItems": 4,
+          "maxItems": 4,
+          "default": []
+        },
+        "coin_display": {
+          "type": "array",
+          "description": "Coin counter region [x, y, width, height]",
+          "items": {
+            "type": "integer"
+          },
+          "minItems": 4,
+          "maxItems": 4,
+          "default": []
+        },
+        "producer_area": {
+          "type": "array",
+          "description": "Area containing producers [x, y, width, height]",
+          "items": {
+            "type": "integer"
+          },
+          "minItems": 4,
+          "maxItems": 4,
+          "default": []
+        }
+      },
+      "default": {}
+    },
+    "automation": {
+      "type": "object",
+      "description": "Automation feature toggles and settings",
+      "properties": {
+        "collect_resources": {
+          "type": "boolean",
+          "description": "Auto-collect from producers",
+          "default": true
+        },
+        "fulfill_orders": {
+          "type": "boolean",
+          "description": "Auto-fulfill customer orders",
+          "default": true
+        },
+        "auto_merge": {
+          "type": "boolean",
+          "description": "Enable automatic merging",
+          "default": true
+        },
+        "handle_popups": {
+          "type": "boolean",
+          "description": "Auto-dismiss popups",
+          "default": true
+        },
+        "expand_land": {
+          "type": "boolean",
+          "description": "Auto-purchase land expansions",
+          "default": false
+        },
+        "repair_buildings": {
+          "type": "boolean",
+          "description": "Auto-repair buildings",
+          "default": true
+        },
+        "participate_in_events": {
+          "type": "boolean",
+          "description": "Auto-join events",
+          "default": true
+        },
+        "energy_threshold": {
+          "type": "integer",
+          "description": "Minimum energy before pausing tasks",
+          "minimum": 0,
+          "maximum": 999,
+          "default": 20
+        },
+        "max_coins_per_expansion": {
+          "type": "integer",
+          "description": "Maximum coins to spend on single expansion",
+          "minimum": 0,
+          "default": 5000
+        },
+        "max_coins_per_session": {
+          "type": "integer",
+          "description": "Maximum total coins to spend per session",
+          "minimum": 0,
+          "default": 10000
+        },
+        "order_priority": {
+          "type": "string",
+          "description": "Order fulfillment priority strategy",
+          "enum": ["coins", "speed", "simplicity"],
+          "default": "coins"
+        },
+        "merge_priority": {
+          "type": "string",
+          "description": "Merge priority strategy",
+          "enum": ["speed", "balanced", "efficiency"],
+          "default": "balanced"
+        }
+      },
+      "default": {}
+    },
+    "timing": {
+      "type": "object",
+      "description": "Timing and cooldown settings",
+      "properties": {
+        "scan_interval_resources": {
+          "type": "integer",
+          "description": "Seconds between resource collection scans",
+          "minimum": 5,
+          "default": 30
+        },
+        "scan_interval_orders": {
+          "type": "integer",
+          "description": "Seconds between order board scans",
+          "minimum": 10,
+          "default": 60
+        },
+        "scan_interval_events": {
+          "type": "integer",
+          "description": "Seconds between event checks",
+          "minimum": 60,
+          "default": 300
+        },
+        "merge_delay": {
+          "type": "number",
+          "description": "Delay between merge operations (seconds)",
+          "minimum": 0.01,
+          "maximum": 5.0,
+          "default": 0.05
+        },
+        "click_delay": {
+          "type": "number",
+          "description": "Delay between clicks (seconds)",
+          "minimum": 0.1,
+          "maximum": 5.0,
+          "default": 0.5
+        }
+      },
+      "default": {}
+    },
+    "safety": {
+      "type": "object",
+      "description": "Safety and rate limiting settings",
+      "properties": {
+        "max_actions_per_minute": {
+          "type": "integer",
+          "description": "Maximum automation actions per minute",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 60
+        },
+        "randomize_delays": {
+          "type": "boolean",
+          "description": "Add random variation to delays",
+          "default": true
+        },
+        "humanlike_mouse": {
+          "type": "boolean",
+          "description": "Use humanlike mouse movements",
+          "default": true
+        },
+        "pause_on_manual_input": {
+          "type": "boolean",
+          "description": "Pause automation when user interacts",
+          "default": true
+        }
+      },
+      "default": {}
+    },
+    "active_profile": {
+      "type": "string",
+      "description": "Currently active automation profile",
+      "enum": ["aggressive", "balanced", "passive", "merge_only", "custom"],
+      "default": "balanced"
+    },
+    "telemetry": {
+      "type": "object",
+      "description": "Telemetry and logging settings",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable telemetry collection",
+          "default": true
+        },
+        "log_directory": {
+          "type": "string",
+          "description": "Directory for session logs",
+          "default": "./logs"
+        },
+        "save_session_on_exit": {
+          "type": "boolean",
+          "description": "Save session data when exiting",
+          "default": true
+        }
+      },
+      "default": {}
+    }
+  },
+  "required": ["version"],
+  "additionalProperties": true
+}
+
+
+
