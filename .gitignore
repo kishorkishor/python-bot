@@ -1,4 +1,5 @@
 .venv/
+venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -11,8 +12,12 @@ dist/
 build/
 *.log
 .DS_Store
+Thumbs.db
 *.swp
 *.swo
 *~
 .vscode/
 .idea/
+.cursor/
+.agent-tools/
+.ipynb_checkpoints/
