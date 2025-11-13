@@ -7,18 +7,48 @@ import threading
 import time
 from datetime import datetime
 from multiprocessing import Process, Queue
+from typing import List
 
 import cv2
 import flet as ft
 import keyboard
 import numpy as np
-import pyautogui
+from pyautogui_safe import pyautogui
 import queue as thread_queue
+from PIL import Image
 
 from item_finder import ImageFinder
 from merging_points_selector import MergingPointsSelector
 from screen_area_selector import ScreenAreaSelector
 from template_collector import TemplateCollector
+
+# GPU detection
+def check_gpu_available():
+    """Check if GPU acceleration (OpenCL) is available."""
+    try:
+        import cv2
+        # Try to create a UMat to test OpenCL
+        test_img = cv2.UMat(np.zeros((10, 10, 3), dtype=np.uint8))
+        cv2.UMat.get(test_img)  # Get it back
+        return True
+    except:
+        return False
+
+# Live detection overlay
+try:
+    from live_detection_overlay import LiveDetectionManager
+    LIVE_DETECTION_AVAILABLE = True
+except ImportError:
+    LIVE_DETECTION_AVAILABLE = False
+    LiveDetectionManager = None
+
+# Unified GUI Integration
+try:
+    from unified_gui_integration import add_automation_and_tests_tabs
+    UNIFIED_INTEGRATION_AVAILABLE = True
+except ImportError:
+    UNIFIED_INTEGRATION_AVAILABLE = False
+    add_automation_and_tests_tabs = None
 
 # Import all global variables and callbacks from gui.py
 # We'll import these to preserve functionality
@@ -64,6 +94,10 @@ box_counter_last_value = None
 last_box_counter_read_time = 0.0
 box_counter_failure_logged = False
 tesseract_status = {"available": None, "message": "", "checked_at": 0.0}
+
+# Detection mode and threshold settings
+detection_mode = "cpu"  # "cpu", "gpu", "hybrid", or "express"
+global_threshold = 0.75  # Global threshold (0.50 - 0.95)
 
 # Resource tracking
 resource_regions = {
@@ -676,13 +710,19 @@ def format_hotkey_label(keys):
     return "+".join(sorted(keys))
 
 
+LOG_BACKLOG_LIMIT = 200
 _log_callback = None
+_pending_log_messages = []
 
-def log_message(message):
+def log_message(message, level="info"):
     """Log a message - adapter for Flet"""
     print(message)
     if _log_callback:
-        _log_callback(message)
+        _log_callback(message, level)
+    else:
+        _pending_log_messages.append((message, level))
+        if len(_pending_log_messages) > LOG_BACKLOG_LIMIT:
+            _pending_log_messages.pop(0)
 
 
 def save_config():
@@ -710,6 +750,10 @@ def save_config():
             "slot_overrides": {slot_id: list(coords) for slot_id, coords in slot_overrides.items()},
             "auto_board_detection": auto_board_detection_enabled,
         },
+        "detection_settings": {
+            "detection_mode": detection_mode,
+            "global_threshold": global_threshold,
+        },
     }
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -725,7 +769,7 @@ def load_config():
     global resize_factor, drag_duration_seconds, box_button_point
     global box_amount, board_rows, board_cols, disallowed_slots
     global slot_overrides, auto_board_detection_enabled, box_counter_region
-    global resource_regions
+    global resource_regions, detection_mode, global_threshold
     
     if not os.path.exists(CONFIG_FILE):
         log_message("[info] No saved configuration found. Using defaults.")
@@ -746,6 +790,11 @@ def load_config():
         box_amount = config.get("box_amount", 6)
         box_counter_region = tuple(config.get("box_counter_region", [])) if config.get("box_counter_region") else tuple()
         
+        if LIVE_DETECTION_AVAILABLE and live_detection_manager:
+            if area:
+                live_detection_manager.update_game_area(area)
+            live_detection_manager.set_resize_factor(resize_factor)
+        
         # Load resource regions
         if "resource_regions" in config:
             res_regions = config["resource_regions"]
@@ -765,6 +814,15 @@ def load_config():
             disallowed_slots = set(adv.get("disallowed_slots", []))
             slot_overrides = {k: tuple(v) for k, v in adv.get("slot_overrides", {}).items()}
             auto_board_detection_enabled = adv.get("auto_board_detection", True)
+        
+        # Load detection settings
+        if "detection_settings" in config:
+            det_settings = config["detection_settings"]
+            detection_mode = det_settings.get("detection_mode", "cpu")
+            global_threshold = det_settings.get("global_threshold", 0.75)
+            # Update catalog default threshold
+            from item_finder import TEMPLATE_CATALOG
+            TEMPLATE_CATALOG.set_default_threshold(global_threshold)
         
         log_message("[info] Configuration loaded successfully.")
     except Exception as exc:
@@ -799,6 +857,8 @@ def select_area_callback_wrapper(page_ref, status_ref):
             if coordinates and len(coordinates) == 4:
                 global area
                 area = coordinates
+                if LIVE_DETECTION_AVAILABLE and live_detection_manager:
+                    live_detection_manager.update_game_area(area)
                 if status_ref and status_ref.current:
                     status_ref.current.value = f"Area: {coordinates[0]}x{coordinates[1]} → {coordinates[2]}x{coordinates[3]}"
                     status_ref.current.update()
@@ -983,17 +1043,212 @@ detection_items_container_ref = None
 detection_total_ref = None
 detection_types_ref = None
 detected_count_text_ref = None
+overlay_switch_ref = None
+live_scan_switch_ref = None
 detection_lock = threading.Lock()
 
-def _scan_and_preview_impl(page_ref=None):
-    """Scan current game area and display detected items with PNG previews"""
-    global last_detection_results, detection_items_container_ref, detection_total_ref, detection_types_ref, detected_count_text_ref
+
+def perform_detection_scan(silent: bool = False, skip_lock: bool = False):
+    """Run the image scan and return detection data."""
+    global last_detection_results, detection_lock
+    
+    # Only use lock for UI scans, not background live scans
+    if not skip_lock:
+        if detection_lock.locked():
+            if not silent:
+                log_message("[warn] Detection already in progress.")
+            return None, 0
+        detection_lock.acquire()
     
     try:
         if len(area) != 4:
-            log_message("[error] Set screen area first before scanning")
-            return
+            if not silent:
+                log_message("[error] Set screen area first before scanning")
+            last_detection_results = {}
+            return None, 0
         
+        img_folder = "./img"
+        if not os.path.exists(img_folder):
+            if not silent:
+                log_message(f"[error] Image folder not found: {img_folder}")
+            last_detection_results = {}
+            return None, 0
+        
+        template_paths = get_image_file_paths(img_folder)
+        if not template_paths:
+            if not silent:
+                log_message("[warn] No template images found in img/ folder")
+            last_detection_results = {}
+            return {}, 0
+        
+        detection_results = {}
+        total_detected = 0
+        
+        # OPTIMIZED: Use batched processing with shared screenshot (5-10x faster!)
+        try:
+            # Use find_multiple_images_batched for massive speed improvement
+            batch_results = ImageFinder.find_multiple_images_batched(
+                template_paths,
+                area[0],
+                area[1],
+                area[2],
+                area[3],
+                resize_factor=resize_factor,
+                threshold=global_threshold,
+                detection_mode=detection_mode,
+                batch_size=10,  # OPTIMIZED: Process 10 templates in parallel (was 5)
+                fast_mode=False,  # FIXED: Disabled for accuracy (was causing misdetections)
+            )
+            
+            # Convert batch results to expected format
+            for template_name, points in batch_results.items():
+                if points:
+                    # Find the full template path
+                    template_path = next((p for p in template_paths if os.path.basename(p) == template_name), None)
+                    detection_results[template_name] = {
+                        "count": len(points),
+                        "points": points,
+                        "template_path": template_path,
+                    }
+                    total_detected += len(points)
+        
+        except Exception as batch_exc:
+            if not silent:
+                log_message(f"[warn] Batch processing failed, falling back to sequential: {batch_exc}")
+            
+            # Fallback to sequential processing if batch fails
+            for template_path in template_paths:
+                try:
+                    template_name = os.path.basename(template_path)
+                    points, _ = ImageFinder.find_image_on_screen(
+                        template_path,
+                        area[0],
+                        area[1],
+                        area[2],
+                        area[3],
+                        resize_factor,
+                        threshold=global_threshold,
+                        detection_mode=detection_mode,
+                    )
+                    
+                    if points:
+                        detection_results[template_name] = {
+                            "count": len(points),
+                            "points": points,
+                            "template_path": template_path,
+                        }
+                        total_detected += len(points)
+                except Exception as template_exc:
+                    if not silent:
+                        log_message(f"[warn] Error scanning {os.path.basename(template_path)}: {template_exc}")
+                    continue
+        
+        last_detection_results = detection_results
+        return detection_results, total_detected
+    finally:
+        if not skip_lock:
+            detection_lock.release()
+
+
+def _draw_boxes_on_screenshot(detection_results, game_area):
+    """Draw green boxes and labels on screenshot of game area."""
+    if len(game_area) != 4:
+        return None
+    
+    try:
+        # Take screenshot of game area
+        start_x, start_y, end_x, end_y = game_area
+        width = end_x - start_x
+        height = end_y - start_y
+        
+        screenshot = pyautogui.screenshot(region=(start_x, start_y, width, height))
+        screenshot_cv = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+        
+        # Draw boxes and labels for each detection
+        for template_name, data in detection_results.items():
+            points = data.get('points', [])
+            item_name = os.path.splitext(template_name)[0]
+            
+            for point in points:
+                # Convert screen coordinates to relative coordinates
+                rel_x = point[0] - start_x
+                rel_y = point[1] - start_y
+                
+                # Box size
+                box_size = 50
+                half_size = box_size // 2
+                
+                # Draw green rectangle
+                top_left = (rel_x - half_size, rel_y - half_size)
+                bottom_right = (rel_x + half_size, rel_y + half_size)
+                cv2.rectangle(screenshot_cv, top_left, bottom_right, (0, 255, 0), 2)
+                
+                # Draw label background and text
+                label_text = item_name
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.5
+                thickness = 1
+                
+                # Get text size
+                (text_width, text_height), baseline = cv2.getTextSize(label_text, font, font_scale, thickness)
+                
+                # Label position (below box)
+                label_y = rel_y + half_size + 15
+                label_x = rel_x - text_width // 2
+                
+                # Draw label background
+                cv2.rectangle(
+                    screenshot_cv,
+                    (label_x - 2, label_y - text_height - 2),
+                    (label_x + text_width + 2, label_y + baseline + 2),
+                    (0, 0, 0),
+                    -1  # Filled rectangle
+                )
+                
+                # Draw label text
+                cv2.putText(
+                    screenshot_cv,
+                    label_text,
+                    (label_x, label_y),
+                    font,
+                    font_scale,
+                    (255, 255, 255),
+                    thickness,
+                    cv2.LINE_AA
+                )
+        
+        # Convert back to RGB for PIL
+        screenshot_rgb = cv2.cvtColor(screenshot_cv, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(screenshot_rgb)
+        
+        # Resize if too large (max 800px width for display)
+        max_width = 800
+        if pil_image.width > max_width:
+            ratio = max_width / pil_image.width
+            new_height = int(pil_image.height * ratio)
+            pil_image = pil_image.resize((max_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Convert to base64
+        import io
+        import base64
+        buffer = io.BytesIO()
+        pil_image.save(buffer, format='PNG')
+        img_bytes = buffer.getvalue()
+        img_base64 = base64.b64encode(img_bytes).decode()
+        
+        return img_base64
+        
+    except Exception as e:
+        log_message(f"[error] Failed to draw boxes on screenshot: {e}", "error")
+        import traceback
+        log_message(f"[error] {traceback.format_exc()}", "error")
+        return None
+
+def _scan_and_preview_impl(page_ref=None):
+    """Scan current game area and display detected items with PNG previews"""
+    global last_detection_results, detection_items_container_ref, detection_total_ref, detection_types_ref, detected_count_text_ref, detection_image_ref
+    
+    try:
         log_message("[info] Scanning for items...")
         
         # Update UI to show scanning state
@@ -1013,47 +1268,84 @@ def _scan_and_preview_impl(page_ref=None):
             ]
             detection_items_container_ref.current.update()
         
-        img_folder = "./img"
-        
-        if not os.path.exists(img_folder):
-            log_message(f"[error] Image folder not found: {img_folder}")
+        detection_results, total_detected = perform_detection_scan(silent=False)
+        if detection_results is None:
+            if detection_items_container_ref and detection_items_container_ref.current:
+                detection_items_container_ref.current.controls = [
+                    ft.Container(
+                        content=ft.Text(
+                            "Set your game area and ensure template images exist before scanning.",
+                            color=TEXT_MUTED,
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        padding=24,
+                    )
+                ]
+                detection_items_container_ref.current.update()
+            if detection_total_ref and detection_total_ref.current:
+                detection_total_ref.current.value = "0 items"
+                detection_total_ref.current.update()
+            if detection_types_ref and detection_types_ref.current:
+                detection_types_ref.current.value = "0 types"
+                detection_types_ref.current.update()
+            if detected_count_text_ref and detected_count_text_ref.current:
+                detected_count_text_ref.current.value = "0 items"
+                detected_count_text_ref.current.update()
             return
         
-        template_paths = get_image_file_paths(img_folder)
-        
-        if not template_paths:
-            log_message("[warn] No template images found in img/ folder")
-            return
-        
-        detection_results = {}
-        total_detected = 0
-        
-        for template_path in template_paths:
-            try:
-                template_name = os.path.basename(template_path)
-                points, _ = ImageFinder.find_image_on_screen(
-                    template_path,
-                    area[0], area[1], area[2], area[3],
-                    resize_factor
-                )
-                
-                if points:
-                    detection_results[template_name] = {
-                        'count': len(points),
-                        'points': points,
-                        'template_path': template_path
-                    }
-                    total_detected += len(points)
-            except Exception as template_exc:
-                log_message(f"[warn] Error scanning {os.path.basename(template_path)}: {template_exc}")
-                continue
-        
-        last_detection_results = detection_results
         log_message(f"[info] Scan complete: {total_detected} items ({len(detection_results)} types)")
+        
+        # Draw boxes on screenshot and display in GUI
+        annotated_screenshot = None
+        if detection_results and len(area) == 4:
+            annotated_screenshot = _draw_boxes_on_screenshot(detection_results, area)
+        
+        if LIVE_DETECTION_AVAILABLE:
+            manager = _ensure_live_detection_manager()
+            if manager and manager.is_overlay_running():
+                manager.update_detections_from_scan(detection_results, area, resize_factor)
         
         # Update UI with detected items
         if detection_items_container_ref and detection_items_container_ref.current:
             items_controls = []
+            
+            # Add annotated screenshot at the top if available
+            if annotated_screenshot:
+                items_controls.append(
+                    ft.Container(
+                        content=ft.Column(
+                            controls=[
+                                ft.Text(
+                                    "Detection Preview with Boxes",
+                                    size=16,
+                                    weight=ft.FontWeight.W_600,
+                                    color=ACCENT_BLUE,
+                                ),
+                                ft.Container(
+                                    content=ft.Image(
+                                        src_base64=annotated_screenshot,
+                                        fit=ft.ImageFit.CONTAIN,
+                                        width=800,
+                                        border_radius=8,
+                                    ),
+                                    padding=8,
+                                    bgcolor=hex_with_opacity("#000000", 0.3),
+                                    border=ft.border.all(2, SUCCESS_GREEN),
+                                    border_radius=12,
+                                ),
+                                ft.Text(
+                                    "Green boxes show detected items with labels",
+                                    size=11,
+                                    color=TEXT_SUBTLE,
+                                    text_align=ft.TextAlign.CENTER,
+                                ),
+                            ],
+                            spacing=8,
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        margin=ft.margin.only(bottom=24),
+                    )
+                )
             
             if detection_results:
                 # Sort by count (most detected first)
@@ -1227,6 +1519,305 @@ def scan_and_preview_callback(page_ref=None):
         _scan_and_preview_impl(page_ref=page_ref)
     finally:
         detection_lock.release()
+
+# Live detection overlay callbacks
+live_detection_manager = None
+
+def _ensure_live_detection_manager():
+    """Create the overlay manager if needed and sync core settings."""
+    global live_detection_manager
+    
+    if not LIVE_DETECTION_AVAILABLE:
+        return None
+    
+    if live_detection_manager is None:
+        live_detection_manager = LiveDetectionManager(log_callback=log_message)
+    
+    if len(area) == 4:
+        live_detection_manager.update_game_area(area)
+    live_detection_manager.set_resize_factor(resize_factor)
+    return live_detection_manager
+
+
+_live_scan_frame_count = 0
+
+def _live_scan_callable():
+    """Background-safe scan callable used for live scanning with frame skipping."""
+    global _live_scan_frame_count
+    
+    # OPTIMIZATION: Frame skipping - only scan every 2nd frame for live detection
+    _live_scan_frame_count += 1
+    if _live_scan_frame_count % 2 != 0:
+        return None, 0  # Skip this frame
+    
+    # Don't use the UI lock for live scanning - it runs in background
+    # Use skip_lock=True to avoid blocking on manual scans
+    try:
+        return perform_detection_scan(silent=True, skip_lock=True)
+    except Exception as e:
+        # Silent errors for live scanning to avoid spam
+        return None, 0
+
+
+def toggle_overlay_switch(e, page_ref):
+    """Toggle overlay from switch"""
+    manager = _ensure_live_detection_manager()
+    
+    if not LIVE_DETECTION_AVAILABLE or manager is None:
+        log_message("[error] Live detection not available", "error")
+        e.control.value = False
+        e.control.update()
+        return
+    
+    if len(area) != 4:
+        log_message("[error] Set screen area first before enabling overlay", "error")
+        e.control.value = False
+        e.control.update()
+        return
+    
+    if e.control.value:
+        if manager.start_overlay(game_area=area):
+            log_message(f"[info] Detection overlay enabled at area {area}", "success")
+            if last_detection_results:
+                manager.update_detections_from_scan(last_detection_results, area, resize_factor)
+        else:
+            e.control.value = False
+            e.control.update()
+    else:
+        manager.stop_live_detection()
+        manager.stop_overlay()
+        if live_scan_switch_ref and live_scan_switch_ref.current and live_scan_switch_ref.current.value:
+            live_scan_switch_ref.current.value = False
+            live_scan_switch_ref.current.update()
+        log_message("[info] Detection overlay disabled", "info")
+
+
+def set_detection_mode(mode: str, page_ref, mode_ref, status_ref, tuning_ref):
+    """Set detection mode (cpu/gpu/hybrid/express) and update UI."""
+    global detection_mode
+    
+    detection_mode = mode
+    save_config()
+    
+    # Update status text
+    mode_names = {"cpu": "CPU", "gpu": "GPU", "hybrid": "Hybrid", "express": "Express"}
+    status_texts = {
+        "cpu": "CPU Mode - Most Accurate",
+        "gpu": "GPU Mode - Fast (AMD Optimized)",
+        "hybrid": "Hybrid Mode - Fast + Accurate",
+        "express": "Express Mode - ULTRA FAST (GPU only, no verification)"
+    }
+    
+    if mode_ref and mode_ref.current:
+        mode_ref.current.value = f"Current: {mode_names.get(mode, mode.upper())} Mode"
+        mode_ref.current.update()
+    
+    if status_ref and status_ref.current:
+        status_ref.current.value = status_texts.get(mode, f"{mode.upper()} Mode")
+        status_ref.current.update()
+    
+    # Show/hide advanced tuning panel
+    if tuning_ref and tuning_ref.current:
+        tuning_ref.current.visible = (mode in ["gpu", "hybrid", "express"])
+        tuning_ref.current.update()
+    
+    log_message(f"[info] Detection mode set to: {mode_names.get(mode, mode.upper())}", "info")
+    
+    # Update page
+    try:
+        page_ref.update()
+    except:
+        pass
+
+def update_global_threshold(e, page_ref):
+    """Update global threshold and auto-save."""
+    global global_threshold
+    
+    global_threshold = float(e.control.value)
+    
+    # Update catalog default threshold
+    from item_finder import TEMPLATE_CATALOG
+    TEMPLATE_CATALOG.set_default_threshold(global_threshold)
+    
+    # Auto-save config
+    save_config()
+    
+    log_message(f"[info] Global threshold updated to {global_threshold:.2f} and saved", "info")
+
+def create_advanced_gpu_tuning_panel(templates: List[str], page_ref, container_ref):
+    """Create advanced GPU tuning panel with per-template threshold sliders."""
+    from item_finder import TEMPLATE_CATALOG
+    
+    template_rows = []
+    
+    for template_name in templates:
+        # Get current threshold for this template
+        current_threshold = TEMPLATE_CATALOG.threshold_for(template_name, global_threshold)
+        
+        # Create slider ref for this template
+        slider_ref = ft.Ref[ft.Slider]()
+        value_ref = ft.Ref[ft.Text]()
+        auto_refresh_ref = ft.Ref[ft.Switch]()
+        
+        def make_template_callback(tmpl_name, slider_r, value_r, auto_r):
+            def on_slider_change(e):
+                new_threshold = float(e.control.value)
+                # Update display
+                if value_r and value_r.current:
+                    value_r.current.value = f"{new_threshold:.2f}"
+                    value_r.current.update()
+                # Save to catalog
+                TEMPLATE_CATALOG.set_threshold(tmpl_name, new_threshold)
+                log_message(f"[info] {tmpl_name} threshold set to {new_threshold:.2f} and saved", "info")
+                
+                # Auto-refresh if enabled
+                if auto_r and auto_r.current and auto_r.current.value:
+                    # Trigger a new scan
+                    try:
+                        scan_and_preview_callback(page_ref)
+                    except:
+                        pass
+            
+            return on_slider_change
+        
+        def make_auto_refresh_callback(tmpl_name, slider_r):
+            def on_switch_change(e):
+                if e.control.value:
+                    # Auto-refresh enabled - trigger scan
+                    try:
+                        scan_and_preview_callback(page_ref)
+                    except:
+                        pass
+            return on_switch_change
+        
+        template_row = create_glass_card(
+            ft.Row(
+                controls=[
+                    # Template name
+                    ft.Column(
+                        controls=[
+                            ft.Text(
+                                template_name.replace('.png', '').replace('_', ' ').title(),
+                                size=14,
+                                weight=ft.FontWeight.W_600,
+                                color=TEXT_PRIMARY,
+                            ),
+                            ft.Text(
+                                f"Threshold: {current_threshold:.2f}",
+                                size=11,
+                                color=TEXT_SUBTLE,
+                                ref=value_ref,
+                            ),
+                        ],
+                        spacing=4,
+                        expand=2,
+                    ),
+                    # Threshold slider
+                    ft.Slider(
+                        min=0.50,
+                        max=0.95,
+                        divisions=45,
+                        value=current_threshold,
+                        label="{value}",
+                        on_change=make_template_callback(template_name, slider_ref, value_ref, auto_refresh_ref),
+                        ref=slider_ref,
+                        expand=3,
+                    ),
+                    # Auto-refresh toggle
+                    ft.Switch(
+                        label="Auto",
+                        value=False,
+                        on_change=make_auto_refresh_callback(template_name, slider_ref),
+                        ref=auto_refresh_ref,
+                        label_style=ft.TextStyle(size=11, color=TEXT_PRIMARY),
+                    ),
+                ],
+                spacing=12,
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            ),
+            padding=12,
+            margin=4,
+        )
+        
+        template_rows.append(template_row)
+    
+    return ft.Column(
+        controls=[
+            ft.Row(
+                controls=[
+                    ft.Text(
+                        "Advanced GPU Tuning",
+                        size=18,
+                        weight=ft.FontWeight.W_600,
+                        color=ACCENT_BLUE,
+                        expand=True,
+                    ),
+                    ft.Icon(ft.Icons.SETTINGS, color=ACCENT_BLUE, size=20),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            ),
+            ft.Text(
+                "Fine-tune detection threshold for each template. Changes auto-save to catalog.json",
+                size=11,
+                color=TEXT_SUBTLE,
+            ),
+            ft.Container(height=12),
+            ft.Container(
+                content=ft.Column(
+                    controls=template_rows,
+                    spacing=8,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+                height=400,  # Fixed height with scroll
+                border=ft.border.all(1, GLASS_BORDER),
+                border_radius=12,
+                padding=12,
+                bgcolor=hex_with_opacity("#FFFFFF", 0.1),
+            ),
+        ],
+        spacing=8,
+    )
+
+def toggle_live_detection_button(e, page_ref):
+    """Toggle live detection with single button (on/off)"""
+    manager = _ensure_live_detection_manager()
+    
+    if not LIVE_DETECTION_AVAILABLE or manager is None:
+        log_message("[error] Live detection not available", "error")
+        return
+    
+    if len(area) != 4:
+        log_message("[error] Set screen area first", "error")
+        return
+    
+    # Check if already running
+    is_running = manager.is_overlay_running() or (
+        hasattr(manager, 'detection_thread') and 
+        manager.detection_thread and 
+        manager.detection_thread.is_alive()
+    )
+    
+    if is_running:
+        # Stop live detection and motion detection
+        manager.stop_live_detection()
+        manager.stop_overlay()
+        ImageFinder.enable_motion_detection(False)
+        log_message("[info] Live detection stopped", "info")
+    else:
+        # Enable motion detection for live scanning
+        ImageFinder.enable_motion_detection(True)
+        
+        # Start live detection
+        if not manager.start_overlay(game_area=area):
+            log_message("[error] Failed to start overlay", "error")
+            return
+        
+        manager.start_live_detection(
+            scan_callable=_live_scan_callable,
+            scan_interval=0.2,  # Faster - 200ms updates (with frame skipping = 400ms effective)
+            resize_factor=resize_factor,
+        )
+        log_message("[info] Live detection started - optimized with motion detection & frame skipping", "success")
 
 
 def scan_board_button_callback():
@@ -1405,26 +1996,36 @@ def create_flet_gui(page: ft.Page):
             status_text.current.color = color
             status_text.current.update()
     
-    def update_log(message):
-        if log_view.current:
-            log_view.current.controls.insert(
-                0,
-                ft.Text(
-                    message,
-                    color=TEXT_MUTED,
-                    size=12,
-                    selectable=True,
-                )
+    def update_log(message, level="info"):
+        if not log_view.current:
+            return
+        level_colors = {
+            "info": TEXT_MUTED,
+            "debug": TEXT_SUBTLE,
+            "warn": WARNING_ORANGE,
+            "warning": WARNING_ORANGE,
+            "error": DANGER_RED,
+            "success": SUCCESS_GREEN,
+        }
+        text_color = level_colors.get(level, TEXT_MUTED)
+        log_view.current.controls.insert(
+            0,
+            ft.Text(
+                message,
+                color=text_color,
+                size=12,
+                selectable=True,
             )
-            # Keep only last 100 entries
-            if len(log_view.current.controls) > 100:
-                log_view.current.controls.pop()
+        )
+        # Keep only last 100 entries
+        if len(log_view.current.controls) > 100:
+            log_view.current.controls.pop()
+        try:
             log_view.current.update()
+        except AssertionError:
+            # Control not yet attached to the page; ignore and wait for initial render
+            pass
     
-    # Connect log_message to update_log
-    global _log_callback
-    _log_callback = update_log
-
     # Template collector overlay & status handling
     collector_state = {
         "queue": thread_queue.Queue(),
@@ -2181,7 +2782,7 @@ def create_flet_gui(page: ft.Page):
     )
     
     # Tab Buttons (will be created before tabs)
-    tab_names = ["Quick Start", "Detection", "Settings", "Activity"]
+    tab_names = ["Quick Start", "Detection", "Settings", "Activity", "Grid View", "Automation", "Tests"]
     for i, name in enumerate(tab_names):
         def make_switch(idx):
             return lambda e: switch_tab(e, idx)
@@ -2373,24 +2974,6 @@ def create_flet_gui(page: ft.Page):
                                 ],
                                 spacing=12,
                             ),
-                            ft.Container(height=24),
-                            
-                            ft.Text("Recent Activity", size=18, weight=ft.FontWeight.W_600, color=ACCENT_BLUE),
-                            ft.Container(height=8),
-                            
-                            # Log Preview
-                            ft.Container(
-                                content=ft.Column(
-                                    controls=[],
-                                    spacing=4,
-                                    ref=log_view,
-                                ),
-                                expand=True,
-                                padding=12,
-                                border_radius=12,
-                                bgcolor=hex_with_opacity("#FFFFFF", 0.2),
-                                border=ft.border.all(1, GLASS_BORDER),
-                            ),
                         ],
                         spacing=8,
                     ),
@@ -2405,15 +2988,41 @@ def create_flet_gui(page: ft.Page):
         visible=True,
     )
     
-    # Tab 2: Detection with item preview
-    global detection_items_container_ref, detection_total_ref, detection_types_ref
+    # Tab 2: Detection with item preview - 3 MODES + THRESHOLD TUNING
+    global detection_items_container_ref, detection_total_ref, detection_types_ref, gpu_status_ref
+    global detection_mode_ref, global_threshold_ref, advanced_tuning_container_ref
     detection_items_container_ref = ft.Ref[ft.Column]()
     detection_total_ref = ft.Ref[ft.Text]()
     detection_types_ref = ft.Ref[ft.Text]()
+    gpu_status_ref = ft.Ref[ft.Text]()
+    detection_mode_ref = ft.Ref[ft.Text]()
+    global_threshold_ref = ft.Ref[ft.Slider]()
+    advanced_tuning_container_ref = ft.Ref[ft.Container]()
+    
+    # Check GPU status
+    gpu_available = check_gpu_available()
+    
+    # Get all template files for advanced tuning
+    img_folder = "./img"
+    all_templates = []
+    if os.path.exists(img_folder):
+        all_templates = [f for f in os.listdir(img_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        all_templates.sort()
+    
+    # Get GPU status for display
+    gpu_available = check_gpu_available()
+    mode_status_texts = {
+        "cpu": "CPU Mode - Most Accurate",
+        "gpu": "GPU Mode - Fast + Accurate (AMD Optimized with CPU Verify)" if gpu_available else "GPU Mode - GPU Not Available (Using CPU)",
+        "hybrid": "Hybrid Mode - Fast + Accurate" if gpu_available else "Hybrid Mode - GPU Not Available (Using CPU)",
+        "express": "Express Mode - ULTRA FAST (GPU only, no verification)" if gpu_available else "Express Mode - GPU Not Available (Using CPU)"
+    }
+    current_status_text = mode_status_texts.get(detection_mode, f"{detection_mode.upper()} Mode")
     
     detection_tab = ft.Container(
         content=ft.Column(
             controls=[
+                # Header
                 ft.Row(
                     controls=[
                         ft.Column(
@@ -2423,15 +3032,141 @@ def create_flet_gui(page: ft.Page):
                             ],
                             expand=True,
                         ),
+                    ],
+                ),
+                ft.Container(height=12),
+                
+                # GPU Status Indicator
+                ft.Container(
+                    content=ft.Row(
+                        controls=[
+                            ft.Icon(
+                                ft.Icons.SPEED if gpu_available else ft.Icons.SPEED_OUTLINED,
+                                color=ACCENT_BLUE if gpu_available else TEXT_MUTED,
+                                size=16,
+                            ),
+                            ft.Text(
+                                current_status_text,
+                                size=12,
+                                color=ACCENT_BLUE if gpu_available else TEXT_MUTED,
+                                weight=ft.FontWeight.W_600,
+                                ref=gpu_status_ref,
+                            ),
+                        ],
+                        spacing=6,
+                    ),
+                    padding=ft.padding.symmetric(horizontal=12, vertical=6),
+                    bgcolor=hex_with_opacity(ACCENT_BLUE if gpu_available else TEXT_MUTED, 0.15),
+                    border=ft.border.all(1, hex_with_opacity(ACCENT_BLUE if gpu_available else TEXT_MUTED, 0.3)),
+                    border_radius=8,
+                ),
+                ft.Container(height=24),
+                
+                # Detection Mode Selector (4 buttons)
+                ft.Text("Detection Mode", size=16, weight=ft.FontWeight.W_600, color=ACCENT_BLUE),
+                ft.Container(height=8),
+                ft.Row(
+                    controls=[
                         create_glass_button(
-                            "Detect Items",
-                            on_click=lambda e: scan_and_preview_callback(page),
-                            width=150,
+                            "CPU",
+                            on_click=lambda e: set_detection_mode("cpu", page, detection_mode_ref, gpu_status_ref, advanced_tuning_container_ref),
+                            width=140,
                             height=50,
-                            color=PURPLE,
+                            color=ACCENT_BLUE if detection_mode == "cpu" else TEXT_MUTED,
+                        ),
+                        create_glass_button(
+                            "GPU",
+                            on_click=lambda e: set_detection_mode("gpu", page, detection_mode_ref, gpu_status_ref, advanced_tuning_container_ref),
+                            width=140,
+                            height=50,
+                            color=SUCCESS_GREEN if detection_mode == "gpu" else TEXT_MUTED,
+                        ),
+                        create_glass_button(
+                            "Hybrid",
+                            on_click=lambda e: set_detection_mode("hybrid", page, detection_mode_ref, gpu_status_ref, advanced_tuning_container_ref),
+                            width=140,
+                            height=50,
+                            color=PURPLE if detection_mode == "hybrid" else TEXT_MUTED,
+                        ),
+                        create_glass_button(
+                            "Express",
+                            on_click=lambda e: set_detection_mode("express", page, detection_mode_ref, gpu_status_ref, advanced_tuning_container_ref),
+                            width=140,
+                            height=50,
+                            color="#FF6B35" if detection_mode == "express" else TEXT_MUTED,
                         ),
                     ],
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    spacing=8,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                ),
+                ft.Container(
+                    content=ft.Text(
+                        f"Current: {detection_mode.upper()} Mode",
+                        size=12,
+                        color=TEXT_SUBTLE,
+                        ref=detection_mode_ref,
+                    ),
+                    alignment=ft.alignment.center,
+                ),
+                ft.Container(height=24),
+                
+                # Global Threshold Slider
+                ft.Text("Global Detection Threshold", size=16, weight=ft.FontWeight.W_600, color=ACCENT_BLUE),
+                ft.Container(height=8),
+                ft.Row(
+                    controls=[
+                        ft.Text("0.50", size=12, color=TEXT_MUTED),
+                        ft.Slider(
+                            min=0.50,
+                            max=0.95,
+                            divisions=45,
+                            value=global_threshold,
+                            label="{value}",
+                            on_change=lambda e: update_global_threshold(e, page),
+                            ref=global_threshold_ref,
+                            expand=True,
+                        ),
+                        ft.Text("0.95", size=12, color=TEXT_MUTED),
+                    ],
+                    spacing=12,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                ),
+                ft.Text(
+                    f"Threshold: {global_threshold:.2f} (lower = more sensitive, higher = more strict)",
+                    size=11,
+                    color=TEXT_SUBTLE,
+                    text_align=ft.TextAlign.CENTER,
+                ),
+                ft.Container(height=24),
+                
+                # Action Buttons
+                ft.Row(
+                    controls=[
+                        create_glass_button(
+                            "Show Preview",
+                            on_click=lambda e: scan_and_preview_callback(page),
+                            width=200,
+                            height=55,
+                            color=PURPLE,
+                        ),
+                        create_glass_button(
+                            "Live Detection",
+                            on_click=lambda e: toggle_live_detection_button(e, page),
+                            width=200,
+                            height=55,
+                            color=ACCENT_BLUE,
+                        ),
+                    ],
+                    spacing=20,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                ),
+                ft.Container(height=24),
+                
+                # Advanced GPU Tuning Panel (only visible in GPU/Hybrid modes)
+                ft.Container(
+                    content=create_advanced_gpu_tuning_panel(all_templates, page, advanced_tuning_container_ref),
+                    ref=advanced_tuning_container_ref,
+                    visible=(detection_mode in ["gpu", "hybrid"]),
                 ),
                 ft.Container(height=24),
                 
@@ -2606,6 +3341,197 @@ def create_flet_gui(page: ft.Page):
         expand=True,
     )
     
+    # Grid View Helper Functions
+    def create_game_grid_view(detection_results, game_area, grid_size=(10, 10)):
+        """
+        Create a 2D grid visualization of detected objects.
+        
+        Args:
+            detection_results: Dict with template names and detected points
+            game_area: Tuple (start_x, start_y, end_x, end_y) of game area
+            grid_size: Tuple (rows, cols) for the grid
+        """
+        if not game_area or len(game_area) != 4:
+            return ft.Container(
+                content=ft.Text("Game area not set. Please select your game area first.", color=DANGER_RED, size=14),
+                padding=20,
+                alignment=ft.alignment.center
+            )
+        
+        start_x, start_y, end_x, end_y = game_area
+        width = end_x - start_x
+        height = end_y - start_y
+        rows, cols = grid_size
+        
+        cell_width = width / cols
+        cell_height = height / rows
+        
+        # Create a grid map: (row, col) -> list of items
+        grid_map = {}
+        for r in range(rows):
+            for c in range(cols):
+                grid_map[(r, c)] = []
+        
+        # Map detected objects to grid cells
+        total_items = 0
+        for template_name, data in detection_results.items():
+            points = data.get('points', [])
+            item_name = os.path.splitext(template_name)[0]
+            template_path = data.get('template_path', '')
+            
+            for point in points:
+                px, py = point
+                # Convert to relative coordinates
+                rel_x = px - start_x
+                rel_y = py - start_y
+                
+                # Calculate grid position
+                col = min(cols - 1, max(0, int(rel_x / cell_width)))
+                row = min(rows - 1, max(0, int(rel_y / cell_height)))
+                
+                grid_map[(row, col)].append({
+                    "name": item_name,
+                    "pos": (px, py),
+                    "template": template_name,
+                    "template_path": template_path
+                })
+                total_items += 1
+        
+        # Build row-by-row
+        grid_rows = []
+        empty_count = 0
+        filled_count = 0
+        
+        for r in range(rows):
+            grid_cols = []
+            for c in range(cols):
+                items = grid_map[(r, c)]
+                
+                # Create cell widget
+                if items:
+                    filled_count += 1
+                    # Get the first item
+                    first_item = items[0]
+                    item_name = first_item["name"]
+                    template_path = first_item.get("template_path", "")
+                    
+                    # Determine cell color based on item count
+                    if len(items) > 1:
+                        cell_bg = ft.Colors.with_opacity(0.4, ft.Colors.ORANGE)
+                        border_color = ft.Colors.ORANGE_400
+                    else:
+                        cell_bg = ft.Colors.with_opacity(0.3, ft.Colors.GREEN)
+                        border_color = ft.Colors.GREEN_400
+                    
+                    # Create cell content
+                    cell_content_items = []
+                    
+                    # Try to show item image if exists
+                    if template_path and os.path.exists(template_path):
+                        cell_content_items.append(
+                            ft.Image(
+                                src=template_path,
+                                width=35,
+                                height=35,
+                                fit=ft.ImageFit.CONTAIN,
+                                error_content=ft.Text(item_name[:4], size=9, color=ft.Colors.WHITE)
+                            )
+                        )
+                    else:
+                        cell_content_items.append(
+                            ft.Text(item_name[:6], size=9, color=ft.Colors.WHITE, weight=ft.FontWeight.W_600)
+                        )
+                    
+                    # Show count if multiple items
+                    if len(items) > 1:
+                        cell_content_items.append(
+                            ft.Container(
+                                content=ft.Text(f"×{len(items)}", size=8, color=ft.Colors.YELLOW, weight=ft.FontWeight.BOLD),
+                                bgcolor=ft.Colors.with_opacity(0.7, ft.Colors.BLACK),
+                                padding=ft.padding.symmetric(horizontal=4, vertical=2),
+                                border_radius=4
+                            )
+                        )
+                    
+                    # Build tooltip text
+                    tooltip_text = f"Cell ({r},{c}): {item_name}"
+                    if len(items) > 1:
+                        other_items = [item["name"] for item in items[1:]]
+                        tooltip_text += f"\n+ {', '.join(other_items[:3])}"
+                        if len(items) > 4:
+                            tooltip_text += f"\n... and {len(items) - 4} more"
+                    
+                    cell = ft.Container(
+                        content=ft.Column(
+                            controls=cell_content_items,
+                            alignment=ft.MainAxisAlignment.CENTER,
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                            spacing=2
+                        ),
+                        width=50,
+                        height=50,
+                        bgcolor=cell_bg,
+                        border=ft.border.all(1, border_color),
+                        border_radius=5,
+                        tooltip=tooltip_text,
+                        padding=4
+                    )
+                else:
+                    empty_count += 1
+                    # Empty cell
+                    cell = ft.Container(
+                        content=ft.Text(f"{r},{c}", size=7, color=ft.Colors.with_opacity(0.3, ft.Colors.WHITE)),
+                        width=50,
+                        height=50,
+                        bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.WHITE),
+                        border=ft.border.all(1, ft.Colors.with_opacity(0.1, ft.Colors.WHITE)),
+                        border_radius=5,
+                        alignment=ft.alignment.center
+                    )
+                
+                grid_cols.append(cell)
+            
+            grid_rows.append(
+                ft.Row(
+                    controls=grid_cols,
+                    spacing=2,
+                    alignment=ft.MainAxisAlignment.START
+                )
+            )
+        
+        # Create stats row
+        stats_row = ft.Row(
+            controls=[
+                ft.Text(f"Grid: {rows}×{cols}", size=12, color=TEXT_PRIMARY),
+                ft.Text("•", size=12, color=TEXT_SUBTLE),
+                ft.Text(f"Filled: {filled_count}", size=12, color=SUCCESS_GREEN),
+                ft.Text("•", size=12, color=TEXT_SUBTLE),
+                ft.Text(f"Empty: {empty_count}", size=12, color=TEXT_MUTED),
+                ft.Text("•", size=12, color=TEXT_SUBTLE),
+                ft.Text(f"Total Items: {total_items}", size=12, color=ACCENT_BLUE),
+            ],
+            spacing=8,
+            alignment=ft.MainAxisAlignment.CENTER
+        )
+        
+        return ft.Column(
+            controls=[
+                stats_row,
+                ft.Divider(height=1, color=GLASS_BORDER),
+                ft.Container(height=8),
+                ft.Container(
+                    content=ft.Column(
+                        controls=grid_rows,
+                        spacing=2,
+                        scroll=ft.ScrollMode.AUTO
+                    ),
+                    expand=True
+                )
+            ],
+            spacing=8,
+            expand=True
+        )
+    
     # Tab 3: Settings (placeholder)
     settings_tab = ft.Container(
         content=ft.Column(
@@ -2713,8 +3639,287 @@ def create_flet_gui(page: ft.Page):
         expand=True,
     )
     
+    # Tab 5: Grid View (2D Visualization)
+    grid_view_ref = ft.Ref[ft.Container]()
+    grid_size_rows_ref = ft.Ref[ft.TextField]()
+    grid_size_cols_ref = ft.Ref[ft.TextField]()
+    
+    def update_grid_view():
+        """Refresh the grid visualization with current detection results"""
+        global last_detection_results, area, board_rows, board_cols
+        
+        try:
+            if not last_detection_results:
+                grid_view_ref.current.content = create_glass_card(
+                    ft.Column(
+                        controls=[
+                            ft.Icon(ft.Icons.INFO_OUTLINE, color=WARNING_ORANGE, size=48),
+                            ft.Container(height=16),
+                            ft.Text("No detection data available", size=16, color=TEXT_PRIMARY, weight=ft.FontWeight.W_600),
+                            ft.Text("Run a scan from the Detection tab first", size=13, color=TEXT_MUTED),
+                            ft.Container(height=16),
+                            create_glass_button(
+                                "Go to Detection Tab",
+                                on_click=lambda e: switch_tab(e, 1),  # Switch to Detection tab
+                                width=None,
+                                color=ACCENT_BLUE
+                            )
+                        ],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=8
+                    ),
+                    padding=40
+                )
+                grid_view_ref.current.update()
+                return
+            
+            rows = int(grid_size_rows_ref.current.value or board_rows)
+            cols = int(grid_size_cols_ref.current.value or board_cols)
+            
+            # Validate grid size
+            if rows <= 0 or cols <= 0 or rows > 20 or cols > 20:
+                grid_view_ref.current.content = create_glass_card(
+                    ft.Text("Invalid grid size. Please enter values between 1 and 20.", color=DANGER_RED, size=14),
+                    padding=20
+                )
+                grid_view_ref.current.update()
+                return
+            
+            # Create the grid widget
+            grid_widget = create_game_grid_view(
+                last_detection_results, 
+                area, 
+                grid_size=(rows, cols)
+            )
+            
+            grid_view_ref.current.content = create_glass_card(grid_widget, padding=16)
+            grid_view_ref.current.update()
+            
+            update_log(f"[info] Grid view updated: {rows}×{cols} grid")
+        except Exception as ex:
+            update_log(f"[error] Failed to update grid view: {ex}")
+            grid_view_ref.current.content = create_glass_card(
+                ft.Text(f"Error: {str(ex)}", color=DANGER_RED, size=12),
+                padding=20
+            )
+            grid_view_ref.current.update()
+    
+    def scan_and_update_grid(e):
+        """Run detection scan and update grid view"""
+        update_log("[info] Running detection scan for grid view...")
+        # Trigger detection scan
+        scan_and_preview_callback(page)
+        # Wait a moment for scan to complete, then update grid
+        import threading
+        def delayed_update():
+            time.sleep(0.5)
+            update_grid_view()
+        threading.Thread(target=delayed_update, daemon=True).start()
+    
+    grid_view_tab = ft.Container(
+        content=ft.Column(
+            controls=[
+                # Header
+                ft.Row(
+                    controls=[
+                        ft.Text("2D Game Grid", size=24, weight=ft.FontWeight.W_700, color=PURPLE),
+                        ft.Icon(ft.Icons.GRID_VIEW, color=PURPLE, size=32),
+                    ],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    spacing=12
+                ),
+                ft.Text(
+                    "Visual representation of detected objects in grid coordinates",
+                    size=13,
+                    color=TEXT_MUTED,
+                    text_align=ft.TextAlign.CENTER
+                ),
+                ft.Divider(height=1, color=GLASS_BORDER),
+                ft.Container(height=8),
+                
+                # Controls
+                create_glass_card(
+                    ft.Column(
+                        controls=[
+                            ft.Text("Grid Configuration", size=16, weight=ft.FontWeight.W_600, color=TEXT_PRIMARY),
+                            ft.Container(height=8),
+                            ft.Row(
+                                controls=[
+                                    ft.Container(
+                                        content=ft.Column(
+                                            controls=[
+                                                ft.Text("Rows", size=12, color=TEXT_MUTED),
+                                                ft.TextField(
+                                                    ref=grid_size_rows_ref,
+                                                    value=str(board_rows),
+                                                    width=80,
+                                                    text_align=ft.TextAlign.CENTER,
+                                                    bgcolor=hex_with_opacity("#FFFFFF", 0.1),
+                                                    border_color=GLASS_BORDER,
+                                                    focused_border_color=ACCENT_BLUE,
+                                                    text_size=14,
+                                                    height=45
+                                                ),
+                                            ],
+                                            spacing=4,
+                                            horizontal_alignment=ft.CrossAxisAlignment.CENTER
+                                        ),
+                                        expand=False
+                                    ),
+                                    ft.Text("×", size=20, color=TEXT_SUBTLE),
+                                    ft.Container(
+                                        content=ft.Column(
+                                            controls=[
+                                                ft.Text("Columns", size=12, color=TEXT_MUTED),
+                                                ft.TextField(
+                                                    ref=grid_size_cols_ref,
+                                                    value=str(board_cols),
+                                                    width=80,
+                                                    text_align=ft.TextAlign.CENTER,
+                                                    bgcolor=hex_with_opacity("#FFFFFF", 0.1),
+                                                    border_color=GLASS_BORDER,
+                                                    focused_border_color=ACCENT_BLUE,
+                                                    text_size=14,
+                                                    height=45
+                                                ),
+                                            ],
+                                            spacing=4,
+                                            horizontal_alignment=ft.CrossAxisAlignment.CENTER
+                                        ),
+                                        expand=False
+                                    ),
+                                    ft.Container(width=16),
+                                    create_glass_button(
+                                        "Update Grid",
+                                        on_click=lambda e: update_grid_view(),
+                                        width=140,
+                                        icon=ft.Icons.REFRESH,
+                                        color=ACCENT_BLUE
+                                    ),
+                                    create_glass_button(
+                                        "Scan & Update",
+                                        on_click=scan_and_update_grid,
+                                        width=140,
+                                        icon=ft.Icons.SEARCH,
+                                        color=SUCCESS_GREEN
+                                    ),
+                                ],
+                                alignment=ft.MainAxisAlignment.CENTER,
+                                spacing=12,
+                                wrap=True
+                            ),
+                        ],
+                        spacing=8
+                    ),
+                    padding=16
+                ),
+                
+                ft.Container(height=8),
+                
+                # Grid view container
+                ft.Container(
+                    ref=grid_view_ref,
+                    content=create_glass_card(
+                        ft.Column(
+                            controls=[
+                                ft.Icon(ft.Icons.GRID_ON, color=TEXT_SUBTLE, size=64),
+                                ft.Container(height=16),
+                                ft.Text("Click 'Update Grid' to visualize detected objects", size=14, color=TEXT_MUTED),
+                                ft.Text("or 'Scan & Update' to run a fresh detection scan", size=12, color=TEXT_SUBTLE),
+                            ],
+                            alignment=ft.MainAxisAlignment.CENTER,
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                            spacing=8
+                        ),
+                        padding=40
+                    ),
+                    expand=True
+                ),
+                
+                # Legend
+                ft.Container(height=8),
+                create_glass_card(
+                    ft.Row(
+                        controls=[
+                            ft.Text("Legend:", size=12, color=TEXT_PRIMARY, weight=ft.FontWeight.W_600),
+                            ft.Container(
+                                content=ft.Text("Green", size=10, color=ft.Colors.WHITE),
+                                bgcolor=ft.Colors.with_opacity(0.3, ft.Colors.GREEN),
+                                padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                                border_radius=4,
+                                border=ft.border.all(1, ft.Colors.GREEN_400)
+                            ),
+                            ft.Text("= Single item", size=11, color=TEXT_MUTED),
+                            ft.Container(width=8),
+                            ft.Container(
+                                content=ft.Text("Orange", size=10, color=ft.Colors.WHITE),
+                                bgcolor=ft.Colors.with_opacity(0.4, ft.Colors.ORANGE),
+                                padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                                border_radius=4,
+                                border=ft.border.all(1, ft.Colors.ORANGE_400)
+                            ),
+                            ft.Text("= Multiple items", size=11, color=TEXT_MUTED),
+                            ft.Container(width=8),
+                            ft.Container(
+                                content=ft.Text("Gray", size=10, color=ft.Colors.with_opacity(0.5, ft.Colors.WHITE)),
+                                bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.WHITE),
+                                padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                                border_radius=4,
+                                border=ft.border.all(1, ft.Colors.with_opacity(0.2, ft.Colors.WHITE))
+                            ),
+                            ft.Text("= Empty cell", size=11, color=TEXT_MUTED),
+                        ],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        spacing=8,
+                        wrap=True
+                    ),
+                    padding=12
+                ),
+            ],
+            spacing=12,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True
+        ),
+        padding=20,
+        visible=False,
+        expand=True,
+    )
+    
     # Add tabs to containers list (must be after tabs are defined)
-    tab_containers.extend([quick_start_tab, detection_tab, settings_tab, activity_tab])
+    tab_containers.extend([quick_start_tab, detection_tab, settings_tab, activity_tab, grid_view_tab])
+    
+    # Add Automation and Tests tabs if available
+    automation_orchestrator_ref = [None]  # Use list to allow modification
+    
+    def get_area():
+        return area if area else tuple()
+    
+    def get_config():
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r') as f:
+                    return json.load(f)
+        except:
+            pass
+        return {}
+    
+    if UNIFIED_INTEGRATION_AVAILABLE and add_automation_and_tests_tabs:
+        try:
+            automation_orchestrator_ref[0] = add_automation_and_tests_tabs(
+                page=page,
+                tab_containers=tab_containers,
+                tab_names=tab_names,
+                status_ref=status_text,
+                log_callback=update_log,
+                area_getter=get_area,
+                config_getter=get_config
+            )
+            update_log("[info] Automation and Tests tabs added successfully")
+        except Exception as e:
+            update_log(f"[error] Failed to add automation tabs: {e}")
+            import traceback
+            update_log(f"[error] Traceback: {traceback.format_exc()}")
     
     # Main Layout
     page.add(
@@ -2752,7 +3957,14 @@ def create_flet_gui(page: ft.Page):
             padding=0,
         )
     )
-    
+
+    global _log_callback
+    _log_callback = update_log
+    if _pending_log_messages:
+        for pending_message, pending_level in list(_pending_log_messages):
+            update_log(pending_message, pending_level)
+        _pending_log_messages.clear()
+
     # Load config on startup
     if load_config:
         load_config()
@@ -2766,6 +3978,12 @@ def create_flet_gui(page: ft.Page):
                     update_resource_display(res_type)
                 except:
                     pass
+    
+    # Initialize live detection manager (will be initialized with game area when needed)
+    global live_detection_manager
+    live_detection_manager = None
+    if LIVE_DETECTION_AVAILABLE:
+        update_log("[info] Live detection overlay available")
     
     # Initialize log
     update_log("Farm Merger Pro initialized")
