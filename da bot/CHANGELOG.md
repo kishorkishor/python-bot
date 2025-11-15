@@ -1,5 +1,13 @@
 # Farm Merger Pro - Changelog
 
+## Unreleased
+
+### ⚡ Live Detection Responsiveness
+- **Instant Boxes**: Live overlay now captures a fresh frame every pass (no caching), so movement is reflected immediately.
+- **Faster Cadence**: Removed frame skipping and adaptive sleep floor so detections can stream at ~120 ms when motion is present.
+- **Smoother Overlay**: Overlay thread now waits on its stop event instead of fixed sleeps, keeping updates accurate without stutter.
+- **Auto Zoom Calibration (Flet)**: Settings now expose the resize factor with an “Auto detect scale” helper so Flet users can recalibrate after zooming or changing resolution without manual threshold tinkering.
+
 ## Version 2.4.1 - Ultra-Modern Glassmorphism UI
 
 ### 🎨 Complete UI Redesign

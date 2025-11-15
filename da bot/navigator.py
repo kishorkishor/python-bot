@@ -9,7 +9,7 @@ import random
 from typing import Dict, List, Tuple, Optional
 from enum import Enum, auto
 
-import pyautogui
+from pyautogui_safe import pyautogui
 
 from game_state_detector import GameStateDetector
 

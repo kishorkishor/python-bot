@@ -10,7 +10,7 @@ from typing import Optional, Tuple, Dict
 
 import cv2
 import numpy as np
-import pyautogui
+from pyautogui_safe import pyautogui
 
 
 class EnergyManager:

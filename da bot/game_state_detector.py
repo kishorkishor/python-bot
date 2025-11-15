@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import pyautogui
+from pyautogui_safe import pyautogui
 
 from item_finder import ImageFinder, TEMPLATE_CATALOG
 

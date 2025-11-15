@@ -1,5 +1,15 @@
 # 🎨 UI Improvements - Farm Merger Pro v2.4
 
+## ⚡ Live Detection Overlay Refresh
+- **Zero-lag updates**: Live scanning no longer skips frames and always captures a fresh screenshot, so overlay boxes move as soon as the board changes.
+- **Adaptive pacing**: Overlay thread now syncs to a 120 ms target cadence (instead of a fixed 200 ms floor) and yields via the stop event for buttery-smooth motion.
+- **Manual snapshot safety**: The pause window still honors manual previews, but the wait now cooperates with the stop event so the overlay never feels stuck.
+
+## 🧭 Auto Zoom Calibration (Flet GUI)
+- **Scale control**: The Settings tab now includes an editable “Current scale” field backed by the global `resize_factor`, so you can match any in-game zoom without hunting for the right number.
+- **Auto detect scale**: The new helper runs `ImageFinder.find_best_resize_factor` over the captured area, automatically picking a zoom multiplier that keeps template matches reliable even on smaller boards.
+- **Persistent sync**: When you update the field (manual entry or auto detect), the value persists to `farm_merger_config.json` and re-syncs with live detection overlays so the boxes stay accurate.
+
 ## 🖼️ Version 2.4 - Revolutionary Screenshot Interface
 
 ### **NEW: Live Preview System** 🎯

@@ -1,12 +1,29 @@
 """Screen region capture helpers for Kishor Farm Merger Pro."""
 
-import tkinter as tk
-from tkinter import ttk
-from pynput import mouse
-from PIL import Image, ImageTk
-import pyautogui
 import threading
 import time
+
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    TK_AVAILABLE = True
+except Exception:
+    tk = None
+    ttk = None
+    TK_AVAILABLE = False
+
+try:
+    from pynput import mouse
+except Exception:
+    mouse = None
+
+try:
+    from PIL import Image, ImageTk
+except Exception:
+    Image = None
+    ImageTk = None
+
+from pyautogui_safe import pyautogui
 
 class ScreenAreaSelector:
     def __init__(self):
@@ -20,6 +37,13 @@ class ScreenAreaSelector:
         self.end_y = None
         self.selection_complete = False
         self.coordinates = None
+        
+        self._headless = not (TK_AVAILABLE and mouse and Image and ImageTk)
+        if self._headless:
+            width, height = pyautogui.size()
+            self.coordinates = (0, 0, width, height)
+            print("[warn] tkinter or display dependencies unavailable; using full-screen area.")
+            return
         
         # Run in a separate thread to prevent blocking
         self._run_selector()

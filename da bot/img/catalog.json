@@ -1,47 +1,201 @@
 {
     "defaults": {
-        "threshold": 0.75,
+        "threshold": 0.78,
         "priority": 5,
         "rarity": "common",
         "reference": false
     },
     "templates": {
-        "carrot1.png": {"rarity": "tier1", "priority": 5, "threshold": 0.75},
-        "carrot2.png": {"rarity": "tier2", "priority": 3, "threshold": 0.74},
-        "carrot3.png": {"rarity": "tier3", "priority": 1, "threshold": 0.73},
-        "chicken1.png": {"rarity": "tier1", "priority": 5, "threshold": 0.76, "reference": true},
-        "chicken2.png": {"rarity": "tier2", "priority": 3, "threshold": 0.74},
-        "chicken3.png": {"rarity": "tier3", "priority": 1, "threshold": 0.72},
-        "copper2.png": {"rarity": "tier2", "priority": 2, "threshold": 0.74},
-        "corn0.png": {"rarity": "base", "priority": 6, "threshold": 0.76, "reference": true},
-        "corn1.png": {"rarity": "tier1", "priority": 5, "threshold": 0.76, "reference": true},
-        "corn2.png": {"rarity": "tier2", "priority": 3, "threshold": 0.74},
-        "corn3.png": {"rarity": "tier3", "priority": 1, "threshold": 0.72},
-        "cow1.png": {"rarity": "tier1", "priority": 5, "threshold": 0.76, "reference": true},
-        "cow2.png": {"rarity": "tier2", "priority": 3, "threshold": 0.74},
-        "cow3.png": {"rarity": "tier3", "priority": 1, "threshold": 0.72},
-        "goat1.png": {"rarity": "tier1", "priority": 5, "threshold": 0.75},
-        "goat2.png": {"rarity": "tier2", "priority": 3, "threshold": 0.73},
-        "goat3.png": {"rarity": "tier3", "priority": 1, "threshold": 0.71},
-        "pig1.png": {"rarity": "tier1", "priority": 5, "threshold": 0.76},
-        "pig2.png": {"rarity": "tier2", "priority": 3, "threshold": 0.74},
-        "pig3.png": {"rarity": "tier3", "priority": 1, "threshold": 0.72},
-        "sheep1.png": {"rarity": "tier1", "priority": 5, "threshold": 0.76},
-        "sheep2.png": {"rarity": "tier2", "priority": 3, "threshold": 0.74},
-        "sheep3.png": {"rarity": "tier3", "priority": 1, "threshold": 0.72},
-        "sliver1.png": {"rarity": "tier1", "priority": 4, "threshold": 0.75},
-        "sliver2.png": {"rarity": "tier2", "priority": 2, "threshold": 0.73},
-        "soybean1.png": {"rarity": "tier1", "priority": 5, "threshold": 0.76, "reference": true},
-        "soybean2.png": {"rarity": "tier2", "priority": 3, "threshold": 0.74},
-        "soybean3.png": {"rarity": "tier3", "priority": 1, "threshold": 0.72},
-        "sugar1.png": {"rarity": "tier1", "priority": 5, "threshold": 0.74},
-        "sugar2.png": {"rarity": "tier2", "priority": 3, "threshold": 0.72},
-        "sugar3.png": {"rarity": "tier3", "priority": 1, "threshold": 0.70},
-        "sunflower1.png": {"rarity": "tier1", "priority": 5, "threshold": 0.75},
-        "sunflower2.png": {"rarity": "tier2", "priority": 3, "threshold": 0.73},
-        "sunflower3.png": {"rarity": "tier3", "priority": 1, "threshold": 0.71},
-        "wheat1.png": {"rarity": "tier1", "priority": 5, "threshold": 0.76, "reference": true},
-        "wheat2.png": {"rarity": "tier2", "priority": 3, "threshold": 0.74},
-        "wheat3.png": {"rarity": "tier3", "priority": 1, "threshold": 0.72}
+        "carrot1.png": {
+            "rarity": "tier1",
+            "priority": 5,
+            "threshold": 0.75
+        },
+        "carrot2.png": {
+            "rarity": "tier2",
+            "priority": 3,
+            "threshold": 0.74
+        },
+        "carrot3.png": {
+            "rarity": "tier3",
+            "priority": 1,
+            "threshold": 0.95
+        },
+        "chicken1.png": {
+            "rarity": "tier1",
+            "priority": 5,
+            "threshold": 0.95,
+            "reference": true
+        },
+        "chicken2.png": {
+            "rarity": "tier2",
+            "priority": 3,
+            "threshold": 0.95
+        },
+        "chicken3.png": {
+            "rarity": "tier3",
+            "priority": 1,
+            "threshold": 0.95
+        },
+        "copper2.png": {
+            "rarity": "tier2",
+            "priority": 2,
+            "threshold": 0.95
+        },
+        "corn0.png": {
+            "rarity": "base",
+            "priority": 6,
+            "threshold": 0.95,
+            "reference": true
+        },
+        "corn1.png": {
+            "rarity": "tier1",
+            "priority": 5,
+            "threshold": 0.95,
+            "reference": true
+        },
+        "corn2.png": {
+            "rarity": "tier2",
+            "priority": 3,
+            "threshold": 0.95
+        },
+        "corn3.png": {
+            "rarity": "tier3",
+            "priority": 1,
+            "threshold": 0.72
+        },
+        "cow1.png": {
+            "rarity": "tier1",
+            "priority": 5,
+            "threshold": 0.76,
+            "reference": true
+        },
+        "cow2.png": {
+            "rarity": "tier2",
+            "priority": 3,
+            "threshold": 0.74
+        },
+        "cow3.png": {
+            "rarity": "tier3",
+            "priority": 1,
+            "threshold": 0.72
+        },
+        "goat1.png": {
+            "rarity": "tier1",
+            "priority": 5,
+            "threshold": 0.75
+        },
+        "goat2.png": {
+            "rarity": "tier2",
+            "priority": 3,
+            "threshold": 0.73
+        },
+        "goat3.png": {
+            "rarity": "tier3",
+            "priority": 1,
+            "threshold": 0.71
+        },
+        "pig1.png": {
+            "rarity": "tier1",
+            "priority": 5,
+            "threshold": 0.76
+        },
+        "pig2.png": {
+            "rarity": "tier2",
+            "priority": 3,
+            "threshold": 0.74
+        },
+        "pig3.png": {
+            "rarity": "tier3",
+            "priority": 1,
+            "threshold": 0.72
+        },
+        "sheep1.png": {
+            "rarity": "tier1",
+            "priority": 5,
+            "threshold": 0.76
+        },
+        "sheep2.png": {
+            "rarity": "tier2",
+            "priority": 3,
+            "threshold": 0.74
+        },
+        "sheep3.png": {
+            "rarity": "tier3",
+            "priority": 1,
+            "threshold": 0.72
+        },
+        "sliver1.png": {
+            "rarity": "tier1",
+            "priority": 4,
+            "threshold": 0.75
+        },
+        "sliver2.png": {
+            "rarity": "tier2",
+            "priority": 2,
+            "threshold": 0.73
+        },
+        "soybean1.png": {
+            "rarity": "tier1",
+            "priority": 5,
+            "threshold": 0.76,
+            "reference": true
+        },
+        "soybean2.png": {
+            "rarity": "tier2",
+            "priority": 3,
+            "threshold": 0.74
+        },
+        "soybean3.png": {
+            "rarity": "tier3",
+            "priority": 1,
+            "threshold": 0.72
+        },
+        "sugar1.png": {
+            "rarity": "tier1",
+            "priority": 5,
+            "threshold": 0.74
+        },
+        "sugar2.png": {
+            "rarity": "tier2",
+            "priority": 3,
+            "threshold": 0.72
+        },
+        "sugar3.png": {
+            "rarity": "tier3",
+            "priority": 1,
+            "threshold": 0.7
+        },
+        "sunflower1.png": {
+            "rarity": "tier1",
+            "priority": 5,
+            "threshold": 0.75
+        },
+        "sunflower2.png": {
+            "rarity": "tier2",
+            "priority": 3,
+            "threshold": 0.73
+        },
+        "sunflower3.png": {
+            "rarity": "tier3",
+            "priority": 1,
+            "threshold": 0.71
+        },
+        "wheat1.png": {
+            "rarity": "tier1",
+            "priority": 5,
+            "threshold": 0.76,
+            "reference": true
+        },
+        "wheat2.png": {
+            "rarity": "tier2",
+            "priority": 3,
+            "threshold": 0.74
+        },
+        "wheat3.png": {
+            "rarity": "tier3",
+            "priority": 1,
+            "threshold": 0.72
+        }
     }
 }

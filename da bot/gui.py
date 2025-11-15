@@ -12,7 +12,7 @@ import cv2
 import dearpygui.dearpygui as dpg
 import keyboard
 import numpy as np
-import pyautogui
+from pyautogui_safe import pyautogui
 
 
 

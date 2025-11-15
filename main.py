@@ -24,7 +24,7 @@ except Exception:
 TEMPLATES_DIR = "."  # current folder with PNGs
 SCREEN_SCALE = 1.0  # downscale factor for preview; matching uses multi-scale
 MATCH_THRESHOLD = 0.7  # default threshold; can override via filename: name@0.7.png
-COOLDOWN_SECONDS = 0.06  # tuned for smoother feel
+COOLDOWN_SECONDS = 0.02  # tighter loop for snappier updates
 USE_GRAYSCALE = True  # grayscale improves robustness
 USE_EDGE_ENHANCE = False  # off for ORB path; keeps colors as-is in preview
 USE_GPU = True  # try OpenCV CUDA when available and compatible
@@ -34,6 +34,8 @@ USE_TEMPLATE_MATCHING = False
 USE_OPENCL = True  # enable OpenCL (AMD/NVIDIA/Intel) via UMat
 USE_DXCAM = True  # DXGI capture; set False to force MSS
 USE_OVERLAY = True  # draw floating boxes on desktop instead of preview window
+DISPLAY_PERSISTENCE_SECONDS = 0.35  # keep detections on-screen briefly to avoid flicker
+DETECTION_MERGE_DISTANCE = 48.0  # px radius to treat detections as the same target
 # Desktop overlay (transparent, click-through) for drawing boxes
 class DesktopOverlay:
 
@@ -114,6 +116,61 @@ class DesktopOverlay:
 			except Exception:
 				pass
 		self.hwnd = None
+
+
+def draw_quad_on_display(display: np.ndarray, quad: np.ndarray, color: Tuple[int, int, int], label: str) -> None:
+	"""Draws detection polygon, bounding box, and label on the preview window."""
+	cv2.polylines(display, [quad], isClosed=True, color=color, thickness=int(2 * UI_SCALE))
+	xmin = int(np.min(quad[:, 0]))
+	xmax = int(np.max(quad[:, 0]))
+	ymin = int(np.min(quad[:, 1]))
+	ymax = int(np.max(quad[:, 1]))
+	cv2.rectangle(display, (xmin, ymin), (xmax, ymax), color, 1)
+	cv2.putText(display, label, (xmin, max(14, ymin - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * UI_SCALE, color, int(2 * UI_SCALE), cv2.LINE_AA)
+
+
+class DetectionCache:
+
+	def __init__(self, ttl_seconds: float, merge_distance: float) -> None:
+		self.ttl = max(0.05, ttl_seconds)
+		self.merge_dist_sq = merge_distance * merge_distance
+		self.entries: List[Dict[str, object]] = []
+
+	def update(self, detections: List[Tuple[str, float, np.ndarray]]) -> List[Tuple[str, float, np.ndarray]]:
+		now = time.time()
+		self.entries = [entry for entry in self.entries if now - entry["ts"] <= self.ttl]
+		for name, conf, quad in detections:
+			quad_int = quad.astype(int)
+			cx = float(np.mean(quad_int[:, 0]))
+			cy = float(np.mean(quad_int[:, 1]))
+			matched_entry = None
+			for entry in self.entries:
+				if entry["name"] != name:
+					continue
+				dx = entry["cx"] - cx
+				dy = entry["cy"] - cy
+				if dx * dx + dy * dy <= self.merge_dist_sq:
+					matched_entry = entry
+					break
+			if matched_entry:
+				matched_entry["quad"] = quad_int
+				matched_entry["conf"] = max(conf, matched_entry["conf"])
+				matched_entry["ts"] = now
+				matched_entry["cx"] = cx
+				matched_entry["cy"] = cy
+			else:
+				self.entries.append({
+					"name": name,
+					"quad": quad_int,
+					"conf": conf,
+					"cx": cx,
+					"cy": cy,
+					"ts": now,
+				})
+		return [(entry["name"], entry["conf"], entry["quad"]) for entry in self.entries]  # type: ignore[list-item]
+
+	def clear(self) -> None:
+		self.entries.clear()
 # We'll scale templates rather than the screen so huge PNGs can match when shown smaller
 TEMPLATE_SCALES = [
 	0.2, 0.25, 0.33, 0.4, 0.5,
@@ -130,6 +187,15 @@ try:
 	os.environ.setdefault("OPENCV_OPENCL_DEVICE", "GPU:AMD")
 except Exception:
 	pass
+
+if USE_ORB:
+	SCENE_ORB = cv2.ORB_create(nfeatures=2500, scaleFactor=1.2, nlevels=8, fastThreshold=7)
+	_FLANN_INDEX_PARAMS = dict(algorithm=6, table_number=12, key_size=12, multi_probe_level=1)
+	_FLANN_SEARCH_PARAMS = dict(checks=64)
+	FLANN_MATCHER = cv2.FlannBasedMatcher(_FLANN_INDEX_PARAMS, _FLANN_SEARCH_PARAMS)
+else:
+	SCENE_ORB = None
+	FLANN_MATCHER = None
 
 
 def parse_threshold_from_name(filename: str, default_thr: float) -> float:
@@ -209,17 +275,18 @@ def orb_match_all(screen_bgr: np.ndarray, templates: Dict[str, Dict]) -> Tuple[L
 	gray = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2GRAY)
 	ugray = cv2.UMat(gray) if USE_OPENCL else gray
 
-	orb = cv2.ORB_create(nfeatures=2500, scaleFactor=1.2, nlevels=8, fastThreshold=7)
-	scene_kp, scene_des = orb.detectAndCompute(ugray, None)
+	orb_detector = SCENE_ORB if SCENE_ORB is not None else cv2.ORB_create(nfeatures=2500, scaleFactor=1.2, nlevels=8, fastThreshold=7)
+	scene_kp, scene_des = orb_detector.detectAndCompute(ugray, None)
 	if isinstance(scene_des, cv2.UMat):
 		scene_des = scene_des.get()
 	if scene_des is None or len(scene_des) == 0:
 		return results, best_scores
 
 	# FLANN-LSH for ORB (binary descriptors)
-	index_params = dict(algorithm=6, table_number=12, key_size=12, multi_probe_level=1)
-	search_params = dict(checks=64)
-	flann = cv2.FlannBasedMatcher(index_params, search_params)
+	flann = FLANN_MATCHER if FLANN_MATCHER is not None else cv2.FlannBasedMatcher(
+		dict(algorithm=6, table_number=12, key_size=12, multi_probe_level=1),
+		dict(checks=64),
+	)
 
 	for info in templates.values():
 		tpl_des = info.get("des")
@@ -443,6 +510,7 @@ def main() -> None:
 		if USE_OVERLAY and win32gui is not None:
 			overlay = DesktopOverlay()
 			overlay.create(mon["width"], mon["height"])  # full desktop size
+		orb_cache = DetectionCache(DISPLAY_PERSISTENCE_SECONDS, DETECTION_MERGE_DISTANCE) if USE_ORB else None
 		while True:
 			if listener_toggle.stop:
 				break
@@ -482,32 +550,39 @@ def main() -> None:
 				if USE_ORB:
 					# ORB path: ignore preview exclusion for simplicity (feature match is robust)
 					orb_results, best_scores = orb_match_all(frame_bgr, templates)
-					for name, conf, quad in orb_results:
-						quad = quad.astype(int)
+					if orb_cache is not None:
+						active_orb = orb_cache.update(orb_results)
+					else:
+						active_orb = []
+						for name, conf, quad in orb_results:
+							active_orb.append((name, conf, quad.astype(int)))
+					overlay_canvas = None
+					use_overlay_now = USE_OVERLAY and overlay is not None
+					if use_overlay_now:
+						overlay_canvas = np.zeros((display.shape[0], display.shape[1], 4), dtype=np.uint8)
+					draw_specs: List[Tuple[np.ndarray, Tuple[int, int, int], str]] = []
+					for name, conf, quad_int in active_orb:
 						color = (0, 200, 255) if conf >= 0.8 else (0, 255, 0) if conf >= 0.6 else (0, 165, 255)
-						# Draw polygon on either overlay or preview
-						if USE_OVERLAY and overlay is not None:
-							canvas = np.zeros((display.shape[0], display.shape[1], 4), dtype=np.uint8)
-							cv2.polylines(canvas, [quad], True, (*color, 255), thickness=int(3 * UI_SCALE), lineType=cv2.LINE_AA)
-							# Label
-							xmin = int(np.min(quad[:, 0])); ymin = int(np.min(quad[:, 1]))
-							label = f"{name} {conf*100:.1f}%"
+						label = f"{name} {conf*100:.1f}%"
+						draw_specs.append((quad_int, color, label))
+						if overlay_canvas is not None:
+							cv2.polylines(overlay_canvas, [quad_int], True, (*color, 255), thickness=int(3 * UI_SCALE), lineType=cv2.LINE_AA)
+							xmin = int(np.min(quad_int[:, 0])); ymin = int(np.min(quad_int[:, 1]))
 							txt_bg = (0, 0, 0, 140)
-							cv2.rectangle(canvas, (xmin, max(0, ymin - int(22 * UI_SCALE))), (xmin + int(240 * UI_SCALE), ymin), txt_bg, -1)
-							cv2.putText(canvas, label, (xmin + 4, max(16, ymin - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * UI_SCALE, (*color, 255), int(2 * UI_SCALE), cv2.LINE_AA)
-							success = overlay.update(canvas)
-							if not success:
-								# Auto-disable overlay on error
-								globals()["USE_OVERLAY"] = False
-								cv2.polylines(display, [quad], isClosed=True, color=color, thickness=int(2 * UI_SCALE))
-								cv2.putText(display, label, (xmin, max(14, ymin - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * UI_SCALE, color, int(2 * UI_SCALE), cv2.LINE_AA)
+							cv2.rectangle(overlay_canvas, (xmin, max(0, ymin - int(22 * UI_SCALE))), (xmin + int(240 * UI_SCALE), ymin), txt_bg, -1)
+							cv2.putText(overlay_canvas, label, (xmin + 4, max(16, ymin - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * UI_SCALE, (*color, 255), int(2 * UI_SCALE), cv2.LINE_AA)
 						else:
-							cv2.polylines(display, [quad], isClosed=True, color=color, thickness=int(2 * UI_SCALE))
-							xmin = int(np.min(quad[:, 0])); xmax = int(np.max(quad[:, 0]))
-							ymin = int(np.min(quad[:, 1])); ymax = int(np.max(quad[:, 1]))
-							cv2.rectangle(display, (xmin, ymin), (xmax, ymax), color, 1)
-							label = f"{name} {conf*100:.1f}%"
-							cv2.putText(display, label, (xmin, max(14, ymin - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * UI_SCALE, color, int(2 * UI_SCALE), cv2.LINE_AA)
+							draw_quad_on_display(display, quad_int, color, label)
+					if overlay_canvas is not None:
+						success = overlay.update(overlay_canvas)
+						if not success:
+							# Auto-disable overlay on error and fall back to HUD drawing
+							globals()["USE_OVERLAY"] = False
+							if overlay is not None:
+								overlay.close()
+							overlay = None
+							for quad_int, color, label in draw_specs:
+								draw_quad_on_display(display, quad_int, color, label)
 					status = "RUNNING"
 				else:
 					# Template path (fallback)
@@ -536,6 +611,8 @@ def main() -> None:
 					status = "RUNNING"
 			else:
 				status = "PAUSED"
+				if orb_cache is not None:
+					orb_cache.clear()
 
 			# If overlay is active, show compact HUD; otherwise show the full preview with boxes
 			if USE_OVERLAY and overlay is not None:

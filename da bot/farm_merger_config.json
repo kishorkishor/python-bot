@@ -1,10 +1,10 @@
 {
     "merge_count": 5,
     "area": [
-        1279,
-        106,
+        1281,
+        105,
         2559,
-        1365
+        1363
     ],
     "hotkey": [
         "="
@@ -14,20 +14,20 @@
     ],
     "merging_points": [
         [
-            1646,
-            862
+            1808,
+            882
         ],
         [
-            1703,
-            890
+            1864,
+            912
         ],
         [
-            1814,
-            942
+            1919,
+            945
         ],
         [
-            1754,
-            913
+            1973,
+            972
         ]
     ],
     "resize_factor": 1.5,
@@ -45,22 +45,22 @@
     ],
     "resource_regions": {
         "coins": [
-            2174,
-            134,
-            65,
-            28
+            2176,
+            130,
+            63,
+            33
         ],
         "gems": [
-            2316,
-            137,
-            52,
-            26
+            2310,
+            133,
+            38,
+            32
         ],
         "thunder": [
-            2447,
-            136,
-            36,
-            28
+            2444,
+            258,
+            28,
+            23
         ]
     },
     "advanced_settings": {
@@ -71,5 +71,13 @@
         ],
         "slot_overrides": {},
         "auto_board_detection": true
+    },
+    "detection_settings": {
+        "detection_mode": "hybrid",
+        "global_threshold": 0.78
+    },
+    "sort_settings": {
+        "sort_strategy": "merge_potential",
+        "merge_threshold": 3
     }
 }

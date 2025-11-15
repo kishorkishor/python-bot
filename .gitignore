@@ -1,23 +1,45 @@
-.venv/
-venv/
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
+*.py[cod]
+*$py.class
 *.so
-*.egg
+.Python
 *.egg-info/
 dist/
 build/
-*.log
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-*~
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
 .vscode/
 .idea/
-.cursor/
-.agent-tools/
-.ipynb_checkpoints/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (user-specific)
+farm_merger_config.json
+da bot/farm_merger_config.json
+
+# Test files
+test_agents/
+tests/
+*.test
+
+# Temporary files
+temp.txt
+*.tmp
+*.log
+
+# Unused/test data
+sussy data/
+leaf.png
+sharp.png
+wheat lvl *.png
+0.24.0

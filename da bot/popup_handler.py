@@ -8,7 +8,7 @@ import time
 import random
 from typing import Dict, List, Tuple, Optional
 
-import pyautogui
+from pyautogui_safe import pyautogui
 
 from game_state_detector import GameStateDetector
 

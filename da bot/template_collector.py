@@ -4,7 +4,7 @@ import os
 import tkinter as tk
 from tkinter import ttk
 from pynput import mouse
-import pyautogui
+from pyautogui_safe import pyautogui
 from PIL import Image, ImageTk
 import time
 import queue

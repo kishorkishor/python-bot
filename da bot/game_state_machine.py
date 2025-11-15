@@ -230,8 +230,17 @@ class GameStateMachine:
         if not self.config['auto_merge']:
             return False
         
-        # Always allow merging if enabled
-        return True
+        merge_ready = game_state.get('merge_ready')
+        if merge_ready is None:
+            return False
+        
+        if isinstance(merge_ready, (list, tuple, set)):
+            return len(merge_ready) > 0
+        
+        if isinstance(merge_ready, dict):
+            return any(bool(value) for value in merge_ready.values())
+        
+        return bool(merge_ready)
     
     def should_expand(self, game_state: Dict) -> bool:
         """

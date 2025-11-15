@@ -1,21 +1,48 @@
 """Merge point selection tooling for Kishor Farm Merger Pro."""
 
-import tkinter as tk
-from tkinter import ttk
-from pynput import mouse
-from PIL import Image, ImageTk, ImageDraw
-import pyautogui
 import time
 
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    TK_AVAILABLE = True
+except Exception:
+    tk = None
+    ttk = None
+    TK_AVAILABLE = False
+
+try:
+    from pynput import mouse
+except Exception:
+    mouse = None
+
+try:
+    from PIL import Image, ImageTk, ImageDraw
+except Exception:
+    Image = None
+    ImageTk = None
+    ImageDraw = None
+
+from pyautogui_safe import pyautogui
+
 class MergingPointsSelector:
-    def __init__(self, point_num):
-        self.point_num = point_num
+    def __init__(self, point_num=None, count=None):
+        if point_num is None and count is None:
+            raise ValueError("point_num or count must be provided")
+        if point_num is None:
+            point_num = count
+        self.point_num = int(point_num)
         self.root = None
         self.canvas = None
         self.listener = None
         self.points = []
         self.point_markers = []
         self.selection_complete = False
+        
+        self._headless = not (TK_AVAILABLE and mouse and Image and ImageTk and ImageDraw)
+        if self._headless:
+            print("[warn] tkinter or display dependencies unavailable; skipping merge-point capture.")
+            return
         
         self._run_selector()
 

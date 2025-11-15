@@ -9,7 +9,7 @@ import random
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
 
-import pyautogui
+from pyautogui_safe import pyautogui
 
 from game_state_detector import GameStateDetector
 

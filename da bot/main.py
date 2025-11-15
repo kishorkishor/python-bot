@@ -5,7 +5,7 @@ from screen_area_selector import ScreenAreaSelector
 from merging_points_selector import MergingPointsSelector
 import os
 import time
-import pyautogui
+from pyautogui_safe import pyautogui
 from pynput import keyboard
 import numpy as np
 import argparse

@@ -129,7 +129,8 @@ class TaskScheduler:
         
         # Statistics
         self.tasks_executed = 0
-        self.tasks_failed = 0
+        self.tasks_failed = 0.3
+        self.last_tick
         self.execution_history = []  # (timestamp, task_name, success)
     
     def add_task(

@@ -1,12 +1,15 @@
 """Kishor Farm Merger Pro GUI module - Flet Edition with Glassmorphism."""
 
+import hashlib
 import json
+import math
 import multiprocessing
 import os
 import threading
 import time
 from datetime import datetime
 from multiprocessing import Process, Queue
+from pathlib import Path
 from typing import List
 
 import cv2
@@ -17,7 +20,7 @@ from pyautogui_safe import pyautogui
 import queue as thread_queue
 from PIL import Image
 
-from item_finder import ImageFinder
+from item_finder import ImageFinder, TEMPLATE_CATALOG
 from merging_points_selector import MergingPointsSelector
 from screen_area_selector import ScreenAreaSelector
 from template_collector import TemplateCollector
@@ -87,6 +90,8 @@ slot_overrides = {}
 disallowed_slots = set()
 sort_plan = []
 auto_board_detection_enabled = True
+sort_strategy = "merge_potential"  # "alphabetical" | "merge_potential"
+merge_threshold = 3  # Minimum items needed to merge
 box_counter_region = tuple()
 last_detected_grid_summary = ""
 last_detected_grid_color = (132, 140, 165, 255)
@@ -98,6 +103,12 @@ tesseract_status = {"available": None, "message": "", "checked_at": 0.0}
 # Detection mode and threshold settings
 detection_mode = "cpu"  # "cpu", "gpu", "hybrid", or "express"
 global_threshold = 0.75  # Global threshold (0.50 - 0.95)
+
+# Auto-detected visualization metadata
+detected_game_area = tuple()
+last_detection_points: List[tuple] = []
+map_stream_callback = None
+detection_map_refresh_handler = None
 
 # Resource tracking
 resource_regions = {
@@ -111,6 +122,9 @@ resource_values = {
     "thunder": 0,
 }
 resource_tracking_enabled = False
+
+BASE_DIR = Path(__file__).resolve().parent
+DETECTION_MAPS_DIR = BASE_DIR / "detection_maps"
 
 # Glassmorphism Color Palette
 BACKGROUND = "#12121C"
@@ -215,6 +229,389 @@ def auto_detect_board_geometry(area_rect, detection_points):
     return {"rows": row_count, "cols": col_count}
 
 
+def classify_item(template_name: str) -> tuple:
+    """
+    Extract base name and tier from template filename.
+    Returns: (base_name, tier) tuple
+    Examples:
+        'chicken1.png' -> ('chicken', 1)
+        'corn2.png' -> ('corn', 2)
+        'wheat3.png' -> ('wheat', 3)
+    """
+    import re
+    # Remove extension
+    name = os.path.splitext(template_name)[0]
+    
+    # Try to extract tier from catalog metadata first
+    try:
+        metadata = TEMPLATE_CATALOG.metadata_for(template_name)
+        rarity = metadata.get("rarity", "")
+        if rarity.startswith("tier"):
+            tier_str = rarity.replace("tier", "")
+            if tier_str.isdigit():
+                tier = int(tier_str)
+                # Extract base name by removing tier number from end
+                base = re.sub(r'\d+$', '', name).rstrip()
+                if base:
+                    return (base, tier)
+    except:
+        pass
+    
+    # Fallback: Extract from filename pattern {base}{tier}.png
+    match = re.match(r'^(.+?)(\d+)$', name)
+    if match:
+        base = match.group(1)
+        tier = int(match.group(2))
+        return (base, tier)
+    
+    # If no pattern matches, treat as base name with tier 0
+    return (name, 0)
+
+
+def get_item_base_name(template_name: str) -> str:
+    """Get base name of an item (without tier)."""
+    base, _ = classify_item(template_name)
+    return base
+
+
+def get_item_tier(template_name: str) -> int:
+    """Get tier of an item."""
+    _, tier = classify_item(template_name)
+    return tier
+
+
+def calculate_merge_potential(board_slots: list, merge_threshold: int = 3) -> dict:
+    """
+    Calculate merge potential for all items on the board.
+    Returns dict with merge groups and priorities.
+    """
+    # Count items by (base_name, tier)
+    item_counts = {}
+    item_slots = {}  # (base, tier) -> list of slot indices
+    
+    for idx, slot in enumerate(board_slots):
+        if not slot.get("type") or not slot.get("allowed"):
+            continue
+        
+        template_name = slot["type"]
+        base, tier = classify_item(template_name)
+        key = (base, tier)
+        
+        if key not in item_counts:
+            item_counts[key] = 0
+            item_slots[key] = []
+        
+        item_counts[key] += 1
+        item_slots[key].append(idx)
+    
+    # Classify merge potential
+    merge_groups = {
+        "mergeable": [],      # 3+ of same tier (can merge now)
+        "accumulating": [],   # 2 of same tier (close to mergeable)
+        "single": [],         # 1 of tier (can accumulate)
+        "isolated": []        # Different tiers or no merge potential
+    }
+    
+    for (base, tier), count in item_counts.items():
+        group_info = {
+            "base": base,
+            "tier": tier,
+            "count": count,
+            "slots": item_slots[(base, tier)],
+            "priority": 0
+        }
+        
+        if count >= merge_threshold:
+            # Mergeable: highest priority
+            group_info["priority"] = 1000 + count  # Higher count = higher priority
+            merge_groups["mergeable"].append(group_info)
+        elif count == 2:
+            # Accumulating: medium priority
+            group_info["priority"] = 500 + tier  # Higher tier = slightly higher priority
+            merge_groups["accumulating"].append(group_info)
+        elif count == 1:
+            # Single: low priority
+            group_info["priority"] = 100 + tier
+            merge_groups["single"].append(group_info)
+        else:
+            # Isolated (shouldn't happen with count > 0, but safety check)
+            group_info["priority"] = 0
+            merge_groups["isolated"].append(group_info)
+    
+    # Sort each group by priority (descending)
+    for group_type in merge_groups:
+        merge_groups[group_type].sort(key=lambda x: (-x["priority"], x["base"], x["tier"]))
+    
+    return merge_groups
+
+
+def generate_merge_potential_sort_plan(board_slots: list, merge_threshold: int = 3) -> list:
+    """
+    Generate a sort plan using greedy merge potential algorithm.
+    Groups items by merge potential and places them in contiguous slots.
+    """
+    if not board_slots:
+        return []
+    
+    # Calculate merge potential
+    merge_groups = calculate_merge_potential(board_slots, merge_threshold)
+    
+    # Get allowed slots sorted by position (row, col)
+    allowed_slots = sorted(
+        (slot for slot in board_slots if slot.get("allowed")),
+        key=lambda s: (s["row"], s["col"])
+    )
+    
+    if not allowed_slots:
+        return []
+    
+    # Create working copy of slots with current state
+    working_slots = [{**slot} for slot in allowed_slots]
+    current_types = [slot.get("type") for slot in working_slots]
+    
+    # Build desired layout: group by merge potential
+    # Priority order: mergeable > accumulating > single > empty
+    desired_types = [None] * len(working_slots)
+    
+    # Map (base, tier) to actual template names found in slots
+    template_name_map = {}  # (base, tier) -> template_name
+    for slot in working_slots:
+        if slot.get("type"):
+            template_name = slot["type"]
+            base, tier = classify_item(template_name)
+            key = (base, tier)
+            if key not in template_name_map:
+                template_name_map[key] = template_name
+    
+    # Assign slots to groups in priority order
+    slot_idx = 0
+    for group_type in ["mergeable", "accumulating", "single"]:
+        for group_info in merge_groups[group_type]:
+            base = group_info["base"]
+            tier = group_info["tier"]
+            count = group_info["count"]
+            key = (base, tier)
+            
+            # Get actual template name for this (base, tier) combination
+            template_name = template_name_map.get(key)
+            if not template_name:
+                continue  # Skip if template name not found
+            
+            # Assign contiguous slots for this group
+            for _ in range(count):
+                if slot_idx < len(desired_types):
+                    desired_types[slot_idx] = template_name
+                    slot_idx += 1
+    
+    # If already sorted, return empty plan
+    if current_types == desired_types:
+        return []
+    
+    # Check if we have empty slots for buffering
+    empty_indices = sorted(i for i, t in enumerate(current_types) if t is None)
+    if not empty_indices:
+        return []  # Cannot sort without empty slots
+    
+    plan_moves = []
+    
+    def recompute_empty_indices():
+        nonlocal empty_indices
+        empty_indices = sorted(i for i, t in enumerate(current_types) if t is None)
+    
+    def append_move(src_idx, dst_idx):
+        if src_idx == dst_idx:
+            return
+        
+        src_slot = working_slots[src_idx]
+        dst_slot = working_slots[dst_idx]
+        
+        item_type = current_types[src_idx]
+        if not item_type:
+            return
+        
+        plan_moves.append({
+            "item": item_type,
+            "source_slot": src_slot["id"],
+            "target_slot": dst_slot["id"],
+            "source_center": src_slot["center"],
+            "target_center": dst_slot["center"],
+        })
+        
+        # Update working state
+        current_types[dst_idx] = current_types[src_idx]
+        current_types[src_idx] = None
+        working_slots[dst_idx]["type"] = item_type
+        working_slots[src_idx]["type"] = None
+        recompute_empty_indices()
+    
+    # Greedy placement algorithm
+    # For each desired position, find the item that should go there
+    for target_idx, desired_type in enumerate(desired_types):
+        if not desired_type:
+            continue  # Empty slot, skip
+        
+        # Check if correct item is already here
+        if current_types[target_idx] == desired_type:
+            continue
+        
+        # Find where the desired item currently is
+        source_idx = None
+        for i, current_type in enumerate(current_types):
+            if current_type == desired_type:
+                source_idx = i
+                break
+        
+        if source_idx is None:
+            continue  # Item not found (shouldn't happen, but safety check)
+        
+        # If item is already in correct position, skip
+        if source_idx == target_idx:
+            continue
+        
+        # Move item to target position
+        # If target is occupied, move target item to empty slot first
+        if current_types[target_idx] is not None:
+            if not empty_indices:
+                # No empty slots, cannot proceed
+                break
+            # Move blocking item to empty slot
+            blocking_item_idx = target_idx
+            empty_idx = empty_indices[0]
+            append_move(blocking_item_idx, empty_idx)
+            # Recompute source_idx after move (it might have changed)
+            for i, current_type in enumerate(current_types):
+                if current_type == desired_type:
+                    source_idx = i
+                    break
+        
+        # Now move desired item to target
+        if source_idx is not None:
+            append_move(source_idx, target_idx)
+    
+    return plan_moves
+
+
+def generate_alphabetical_sort_plan(board_slots: list) -> list:
+    """
+    Generate a sort plan using alphabetical sorting (original algorithm).
+    """
+    if not board_slots:
+        return []
+    
+    allowed_slots = sorted(
+        (slot for slot in board_slots if slot.get("allowed")),
+        key=lambda s: (s["row"], s["col"]),
+    )
+    
+    if not allowed_slots:
+        return []
+    
+    working_slots = [{**slot} for slot in allowed_slots]
+    current_types = [slot.get("type") for slot in working_slots]
+    nonempty_types = [t for t in current_types if t]
+    
+    desired_types = sorted(nonempty_types) + [None] * (len(current_types) - len(nonempty_types))
+    
+    if current_types == desired_types:
+        return []
+    
+    empty_indices = sorted(i for i, t in enumerate(current_types) if t is None)
+    if not empty_indices:
+        return []
+    
+    plan_moves = []
+    
+    def recompute_empty_indices():
+        nonlocal empty_indices
+        empty_indices = sorted(i for i, t in enumerate(current_types) if t is None)
+    
+    def append_move(src_idx, dst_idx):
+        if src_idx == dst_idx:
+            return
+        
+        src_slot = working_slots[src_idx]
+        dst_slot = working_slots[dst_idx]
+        
+        item_type = current_types[src_idx]
+        if not item_type:
+            return
+        
+        plan_moves.append({
+            "item": item_type,
+            "source_slot": src_slot["id"],
+            "target_slot": dst_slot["id"],
+            "source_center": src_slot["center"],
+            "target_center": dst_slot["center"],
+        })
+        
+        current_types[dst_idx] = current_types[src_idx]
+        current_types[src_idx] = None
+        working_slots[dst_idx]["type"] = item_type
+        working_slots[src_idx]["type"] = None
+        recompute_empty_indices()
+    
+    # Simple alphabetical sorting algorithm
+    for target_idx, desired_type in enumerate(desired_types):
+        if not desired_type:
+            continue
+        
+        if current_types[target_idx] == desired_type:
+            continue
+        
+        source_idx = None
+        for i, current_type in enumerate(current_types):
+            if current_type == desired_type:
+                source_idx = i
+                break
+        
+        if source_idx is None:
+            continue
+        
+        if source_idx == target_idx:
+            continue
+        
+        if current_types[target_idx] is not None:
+            if not empty_indices:
+                break
+            blocking_item_idx = target_idx
+            empty_idx = empty_indices[0]
+            append_move(blocking_item_idx, empty_idx)
+            for i, current_type in enumerate(current_types):
+                if current_type == desired_type:
+                    source_idx = i
+                    break
+        
+        if source_idx is not None:
+            append_move(source_idx, target_idx)
+    
+    return plan_moves
+
+
+def generate_auto_sort_plan():
+    """
+    Generate auto sort plan based on selected strategy.
+    """
+    global sort_plan, sort_strategy, merge_threshold
+    
+    sort_plan.clear()
+    
+    if not board_slots:
+        log_message("[warn] Run a board scan before generating a sort plan.")
+        return False
+    
+    if sort_strategy == "merge_potential":
+        sort_plan = generate_merge_potential_sort_plan(board_slots, merge_threshold)
+    else:  # alphabetical
+        sort_plan = generate_alphabetical_sort_plan(board_slots)
+    
+    if not sort_plan:
+        log_message("[info] Items already sorted. No moves required.")
+        return True
+    
+    log_message(f"[info] Generated sort plan with {len(sort_plan)} move(s) using {sort_strategy} strategy.")
+    return True
+
+
 def detect_board_layout(area_rect, rows, cols, resize):
     """Detect board layout and create slot map"""
     global board_rows, board_cols, last_detected_grid_summary, last_detected_grid_color
@@ -291,6 +688,8 @@ def detect_board_layout(area_rect, rows, cols, resize):
                 "type": None,
                 "template": None,
                 "detected_center": None,
+                "last_seen_time": None,  # Timestamp of last detection
+                "detection_count": 0,    # How many times item was detected at this position
             }
             override = slot_overrides.get(slot_id)
             if override and len(override) == 2:
@@ -308,10 +707,18 @@ def detect_board_layout(area_rect, rows, cols, resize):
                 slot["type"] = template_name
                 slot["template"] = template_path
                 slot["detected_center"] = point
+                slot["last_seen_time"] = time.time()
+                slot["detection_count"] = 1
             else:
-                slot.setdefault("duplicates", []).append(
-                    {"type": template_name, "template": template_path, "center": point}
-                )
+                # Update position memory if same item detected again
+                if slot["type"] == template_name:
+                    slot["detected_center"] = point
+                    slot["last_seen_time"] = time.time()
+                    slot["detection_count"] = slot.get("detection_count", 0) + 1
+                else:
+                    slot.setdefault("duplicates", []).append(
+                        {"type": template_name, "template": template_path, "center": point}
+                    )
 
     last_detected_grid_summary = detection_summary
     last_detected_grid_color = detection_color
@@ -521,6 +928,8 @@ def perform_box_clicks_at_point(point, queue_log, num_clicks=5):
 
 def perform_merge_cycle(image_files, area_rect, scale, count, points, queue_log, drag_duration):
     """Enhanced merge cycle with priority-based merging"""
+    global detection_mode, global_threshold
+    
     producer_templates = []
     regular_templates = []
     
@@ -533,10 +942,21 @@ def perform_merge_cycle(image_files, area_rect, scale, count, points, queue_log,
     
     prioritized_templates = producer_templates + regular_templates
     
+    # Use the selected detection mode (CPU/GPU/Hybrid/Express) for fast and accurate detection
+    # Hybrid mode is recommended: GPU pyramid + CPU verification = fast + accurate
+    current_detection_mode = detection_mode if detection_mode else "cpu"
+    current_threshold = global_threshold if global_threshold else 0.75
+    
     for target_image in prioritized_templates:
-        template_centers, _ = ImageFinder.find_image_on_screen(target_image, *area_rect, scale)
+        template_centers, _ = ImageFinder.find_image_on_screen(
+            target_image, 
+            *area_rect, 
+            scale,
+            threshold=current_threshold,
+            detection_mode=current_detection_mode
+        )
         if template_centers:
-            queue_log(f"[info] Found {len(template_centers)} matches for {os.path.basename(target_image)}.")
+            queue_log(f"[info] Found {len(template_centers)} matches for {os.path.basename(target_image)} (using {current_detection_mode.upper()} mode).")
         if len(template_centers) > count - 1 and len(points) >= count - 1:
             perform_merge_operations(template_centers, points, count, queue_log, drag_duration)
             queue_log("[info] Drag operations completed.")
@@ -754,6 +1174,10 @@ def save_config():
             "detection_mode": detection_mode,
             "global_threshold": global_threshold,
         },
+        "sort_settings": {
+            "sort_strategy": sort_strategy,
+            "merge_threshold": merge_threshold,
+        },
     }
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -770,6 +1194,7 @@ def load_config():
     global box_amount, board_rows, board_cols, disallowed_slots
     global slot_overrides, auto_board_detection_enabled, box_counter_region
     global resource_regions, detection_mode, global_threshold
+    global sort_strategy, merge_threshold
     
     if not os.path.exists(CONFIG_FILE):
         log_message("[info] No saved configuration found. Using defaults.")
@@ -824,9 +1249,87 @@ def load_config():
             from item_finder import TEMPLATE_CATALOG
             TEMPLATE_CATALOG.set_default_threshold(global_threshold)
         
+        # Load sort settings
+        if "sort_settings" in config:
+            sort_settings = config["sort_settings"]
+            sort_strategy = sort_settings.get("sort_strategy", "merge_potential")
+            merge_threshold = sort_settings.get("merge_threshold", 3)
+        
         log_message("[info] Configuration loaded successfully.")
     except Exception as exc:
         log_message(f"[error] Unable to load configuration: {exc}")
+
+
+def refresh_resize_factor_field():
+    """Sync the resize factor input field with the current configuration."""
+    if resize_factor_input_ref and resize_factor_input_ref.current:
+        try:
+            resize_factor_input_ref.current.value = f"{resize_factor:.2f}"
+            resize_factor_input_ref.current.update()
+        except Exception:
+            pass
+
+
+def apply_resize_factor_value(value: float, persist: bool = False):
+    """Apply a new resize factor, optionally persisting to config."""
+    global resize_factor
+    resize_factor = float(value)
+    if live_detection_manager:
+        live_detection_manager.set_resize_factor(resize_factor)
+    refresh_resize_factor_field()
+    if persist:
+        save_config()
+
+
+def update_resize_factor_from_input(e):
+    """Update resize factor when the user submits a new value."""
+    if not e or not hasattr(e, "control"):
+        return
+
+    raw = (e.control.value or "").strip()
+    if not raw:
+        refresh_resize_factor_field()
+        return
+
+    try:
+        candidate = float(raw)
+        if candidate <= 0:
+            raise ValueError("must be positive")
+        apply_resize_factor_value(candidate, persist=True)
+        log_message(f"[info] Resize factor set to {resize_factor:.2f}")
+    except Exception as exc:
+        log_message(f"[error] Resize factor must be a positive number: {exc}")
+        refresh_resize_factor_field()
+
+
+def auto_calculate_resize_factor(e):
+    """Run ImageFinder.find_best_resize_factor under the current area."""
+    if len(area) != 4:
+        log_message("[error] Set the screen area before auto-detecting zoom.")
+        return
+
+    button = None
+    if resize_factor_button_ref and resize_factor_button_ref.current:
+        button = resize_factor_button_ref.current
+        button.disabled = True
+        button.text = "Calculating..."
+        button.update()
+
+    try:
+        finder = ImageFinder()
+        best_factor = finder.find_best_resize_factor(area)
+        if best_factor and best_factor > 0:
+            apply_resize_factor_value(best_factor, persist=True)
+            log_message(f"[info] Auto-detected resize factor: {resize_factor:.2f}")
+        else:
+            log_message("[warn] Auto detection did not find a valid zoom level.")
+    except Exception as exc:
+        log_message(f"[error] Auto resize calculation failed: {exc}")
+    finally:
+        if button:
+            button.disabled = False
+            button.text = "Auto detect scale"
+            button.update()
 
 
 # Callback wrappers - these will call original functions when needed
@@ -1046,11 +1549,27 @@ detected_count_text_ref = None
 overlay_switch_ref = None
 live_scan_switch_ref = None
 detection_lock = threading.Lock()
+resize_factor_input_ref = None
+resize_factor_button_ref = None
 
 
-def perform_detection_scan(silent: bool = False, skip_lock: bool = False):
+def get_effective_game_area():
+    """Return the dynamically detected game area or fall back to manual selection."""
+    if isinstance(detected_game_area, tuple) and len(detected_game_area) == 4:
+        return detected_game_area
+    if isinstance(area, tuple) and len(area) == 4:
+        return area
+    return tuple()
+
+
+def perform_detection_scan(
+    silent: bool = False,
+    skip_lock: bool = False,
+    progress_callback=None,
+    force_fresh_capture: bool = False,
+):
     """Run the image scan and return detection data."""
-    global last_detection_results, detection_lock
+    global last_detection_results, detection_lock, detected_game_area, last_detection_points
     
     # Only use lock for UI scans, not background live scans
     if not skip_lock:
@@ -1061,11 +1580,20 @@ def perform_detection_scan(silent: bool = False, skip_lock: bool = False):
         detection_lock.acquire()
     
     try:
-        if len(area) != 4:
+        manual_area_available = len(area) == 4
+        if manual_area_available:
+            scan_area = area
+        else:
+            try:
+                screen_width, screen_height = pyautogui.size()
+            except Exception as size_exc:
+                if not silent:
+                    log_message(f"[error] Unable to determine screen size for scanning: {size_exc}")
+                last_detection_results = {}
+                return None, 0
+            scan_area = (0, 0, screen_width, screen_height)
             if not silent:
-                log_message("[error] Set screen area first before scanning")
-            last_detection_results = {}
-            return None, 0
+                log_message("[info] No screen area configured. Scanning full display to locate the board.")
         
         img_folder = "./img"
         if not os.path.exists(img_folder):
@@ -1079,42 +1607,74 @@ def perform_detection_scan(silent: bool = False, skip_lock: bool = False):
             if not silent:
                 log_message("[warn] No template images found in img/ folder")
             last_detection_results = {}
+            detected_game_area = tuple()
+            last_detection_points = []
             return {}, 0
         
         detection_results = {}
         total_detected = 0
+        start_x, start_y, end_x, end_y = scan_area
+        aggregated_points = []
+
+        def _notify_stream(area_hint=None):
+            # NOTE: This callback is for UI updates only, NOT for overlay updates
+            # Overlay updates happen separately after ALL detection is complete
+            # to prevent "two waves" of green boxes in hybrid mode
+            if progress_callback:
+                try:
+                    progress_callback(detection_results, list(aggregated_points), area_hint or scan_area)
+                except Exception as cb_exc:
+                    if not silent:
+                        log_message(f"[warn] Detection stream callback failed: {cb_exc}")
         
         # OPTIMIZED: Use batched processing with shared screenshot (5-10x faster!)
         try:
             # Use find_multiple_images_batched for massive speed improvement
             batch_results = ImageFinder.find_multiple_images_batched(
                 template_paths,
-                area[0],
-                area[1],
-                area[2],
-                area[3],
+                start_x,
+                start_y,
+                end_x,
+                end_y,
                 resize_factor=resize_factor,
                 threshold=global_threshold,
                 detection_mode=detection_mode,
                 batch_size=10,  # OPTIMIZED: Process 10 templates in parallel (was 5)
                 fast_mode=False,  # FIXED: Disabled for accuracy (was causing misdetections)
+                enable_cache=not force_fresh_capture,
             )
             
-            # Convert batch results to expected format
+            # IMPORTANT: Convert ALL batch results to expected format BEFORE updating detection_results
+            # This ensures hybrid mode's GPU+CPU verification completes for ALL templates
+            # before any results are added, preventing "two waves" of green boxes in overlay
+            temp_detection_results = {}
+            temp_total_detected = 0
+            temp_aggregated_points = []
+            
             for template_name, points in batch_results.items():
                 if points:
-                    # Find the full template path
                     template_path = next((p for p in template_paths if os.path.basename(p) == template_name), None)
-                    detection_results[template_name] = {
+                    temp_detection_results[template_name] = {
                         "count": len(points),
                         "points": points,
                         "template_path": template_path,
                     }
-                    total_detected += len(points)
+                    temp_total_detected += len(points)
+                    temp_aggregated_points.extend(points)
+            
+            # Only update detection_results after ALL templates are processed
+            # This prevents partial updates that cause two waves in overlay
+            detection_results.update(temp_detection_results)
+            total_detected = temp_total_detected
+            aggregated_points = temp_aggregated_points
         
         except Exception as batch_exc:
             if not silent:
                 log_message(f"[warn] Batch processing failed, falling back to sequential: {batch_exc}")
+            
+            temp_detection_results = {}
+            temp_total_detected = 0
+            temp_aggregated_points = []
             
             # Fallback to sequential processing if batch fails
             for template_path in template_paths:
@@ -1122,26 +1682,54 @@ def perform_detection_scan(silent: bool = False, skip_lock: bool = False):
                     template_name = os.path.basename(template_path)
                     points, _ = ImageFinder.find_image_on_screen(
                         template_path,
-                        area[0],
-                        area[1],
-                        area[2],
-                        area[3],
+                        start_x,
+                        start_y,
+                        end_x,
+                        end_y,
                         resize_factor,
                         threshold=global_threshold,
                         detection_mode=detection_mode,
                     )
                     
                     if points:
-                        detection_results[template_name] = {
+                        temp_detection_results[template_name] = {
                             "count": len(points),
                             "points": points,
                             "template_path": template_path,
                         }
-                        total_detected += len(points)
+                        temp_total_detected += len(points)
+                        temp_aggregated_points.extend(points)
                 except Exception as template_exc:
                     if not silent:
                         log_message(f"[warn] Error scanning {os.path.basename(template_path)}: {template_exc}")
                     continue
+            
+            detection_results.update(temp_detection_results)
+            total_detected += temp_total_detected
+            aggregated_points = temp_aggregated_points
+        
+        last_detection_points = [pt for data in detection_results.values() for pt in data.get("points", [])]
+        if last_detection_points:
+            min_x = min(pt[0] for pt in last_detection_points)
+            min_y = min(pt[1] for pt in last_detection_points)
+            max_x = max(pt[0] for pt in last_detection_points)
+            max_y = max(pt[1] for pt in last_detection_points)
+            padding = 20
+            try:
+                screen_width, screen_height = pyautogui.size()
+            except Exception:
+                screen_width = end_x
+                screen_height = end_y
+            detected_game_area = (
+                int(max(0, min_x - padding)),
+                int(max(0, min_y - padding)),
+                int(min(screen_width, max_x + padding)),
+                int(min(screen_height, max_y + padding)),
+            )
+            _notify_stream(detected_game_area)
+        else:
+            detected_game_area = tuple()
+            _notify_stream()
         
         last_detection_results = detection_results
         return detection_results, total_detected
@@ -1244,9 +1832,104 @@ def _draw_boxes_on_screenshot(detection_results, game_area):
         log_message(f"[error] {traceback.format_exc()}", "error")
         return None
 
+
+def _color_from_name(name: str) -> str:
+    """Generate a deterministic pastel-style color for visualization."""
+    digest = hashlib.md5(name.encode("utf-8")).hexdigest()
+    r = int(digest[0:2], 16)
+    g = int(digest[2:4], 16)
+    b = int(digest[4:6], 16)
+    r = (r + 180) // 2
+    g = (g + 180) // 2
+    b = (b + 180) // 2
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def build_detection_map_entries(detection_results, game_area):
+    """Normalize detection results into relative coordinates for rendering/saving."""
+    if not detection_results or len(game_area) != 4:
+        return []
+
+    start_x, start_y, end_x, end_y = game_area
+    width = max(1, end_x - start_x)
+    height = max(1, end_y - start_y)
+
+    entries = []
+    counter = 1
+    for template_name, data in sorted(detection_results.items()):
+        display_name = os.path.splitext(template_name)[0]
+        template_path = data.get("template_path")
+        for point in data.get("points", []):
+            px, py = point
+            rel_x = (px - start_x) / width
+            rel_y = (py - start_y) / height
+            entries.append(
+                {
+                    "id": f"{display_name}-{counter}",
+                    "index": counter,
+                    "template": template_name,
+                    "display_name": display_name,
+                    "color": _color_from_name(template_name),
+                    "screen": {"x": int(px), "y": int(py)},
+                    "normalized": {
+                        "x": max(0.0, min(1.0, rel_x)),
+                        "y": max(0.0, min(1.0, rel_y)),
+                    },
+                    "template_path": template_path,
+                }
+            )
+            counter += 1
+    return entries
+
+
+def save_detection_map_snapshot(detection_results, game_area):
+    """Persist detection data for later map-building."""
+    if not detection_results or len(game_area) != 4:
+        return None, "No detection results or missing game area."
+
+    entries = build_detection_map_entries(detection_results, game_area)
+    if not entries:
+        return None, "No detection points available."
+
+    timestamp = datetime.utcnow().isoformat()
+    snapshot = {
+        "saved_at": timestamp,
+        "game_area": {
+            "start_x": int(game_area[0]),
+            "start_y": int(game_area[1]),
+            "end_x": int(game_area[2]),
+            "end_y": int(game_area[3]),
+        },
+        "detection_count": len(entries),
+        "detections": [
+            {
+                "id": entry["id"],
+                "template": entry["template"],
+                "display_name": entry["display_name"],
+                "detected_at": timestamp,
+                "screen": entry["screen"],
+                "normalized": {
+                    "x": round(entry["normalized"]["x"], 6),
+                    "y": round(entry["normalized"]["y"], 6),
+                },
+                "template_path": entry.get("template_path"),
+            }
+            for entry in entries
+        ],
+    }
+
+    DETECTION_MAPS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"detection_map_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    file_path = DETECTION_MAPS_DIR / filename
+    with file_path.open("w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle, indent=2)
+    return str(file_path), None
+
+
 def _scan_and_preview_impl(page_ref=None):
     """Scan current game area and display detected items with PNG previews"""
-    global last_detection_results, detection_items_container_ref, detection_total_ref, detection_types_ref, detected_count_text_ref, detection_image_ref
+    global last_detection_results, detection_items_container_ref, detection_total_ref, detection_types_ref, \
+        detected_count_text_ref, detection_image_ref, map_stream_callback, detection_map_refresh_handler
     
     try:
         log_message("[info] Scanning for items...")
@@ -1268,7 +1951,8 @@ def _scan_and_preview_impl(page_ref=None):
             ]
             detection_items_container_ref.current.update()
         
-        detection_results, total_detected = perform_detection_scan(silent=False)
+        progress_handler = map_stream_callback
+        detection_results, total_detected = perform_detection_scan(silent=False, progress_callback=progress_handler)
         if detection_results is None:
             if detection_items_container_ref and detection_items_container_ref.current:
                 detection_items_container_ref.current.controls = [
@@ -1297,13 +1981,18 @@ def _scan_and_preview_impl(page_ref=None):
         
         # Draw boxes on screenshot and display in GUI
         annotated_screenshot = None
-        if detection_results and len(area) == 4:
-            annotated_screenshot = _draw_boxes_on_screenshot(detection_results, area)
+        display_area = get_effective_game_area()
+        if detection_results and len(display_area) == 4:
+            annotated_screenshot = _draw_boxes_on_screenshot(detection_results, display_area)
         
         if LIVE_DETECTION_AVAILABLE:
             manager = _ensure_live_detection_manager()
-            if manager and manager.is_overlay_running():
-                manager.update_detections_from_scan(detection_results, area, resize_factor)
+            if manager and manager.is_overlay_running() and detection_results and len(display_area) == 4:
+                manager.display_manual_snapshot(
+                    detection_results,
+                    display_area,
+                    resize_factor,
+                )
         
         # Update UI with detected items
         if detection_items_container_ref and detection_items_container_ref.current:
@@ -1476,6 +2165,12 @@ def _scan_and_preview_impl(page_ref=None):
         if detected_count_text_ref and detected_count_text_ref.current:
             detected_count_text_ref.current.value = total_label
             detected_count_text_ref.current.update()
+
+        if detection_map_refresh_handler:
+            try:
+                detection_map_refresh_handler()
+            except Exception as refresh_exc:
+                log_message(f"[warn] Detection map refresh failed: {refresh_exc}")
         
     except Exception as exc:
         log_message(f"[error] Scan error: {exc}")
@@ -1539,21 +2234,16 @@ def _ensure_live_detection_manager():
     return live_detection_manager
 
 
-_live_scan_frame_count = 0
-
 def _live_scan_callable():
-    """Background-safe scan callable used for live scanning with frame skipping."""
-    global _live_scan_frame_count
-    
-    # OPTIMIZATION: Frame skipping - only scan every 2nd frame for live detection
-    _live_scan_frame_count += 1
-    if _live_scan_frame_count % 2 != 0:
-        return None, 0  # Skip this frame
-    
+    """Background-safe scan callable used for live scanning (always captures fresh frames)."""
     # Don't use the UI lock for live scanning - it runs in background
     # Use skip_lock=True to avoid blocking on manual scans
     try:
-        return perform_detection_scan(silent=True, skip_lock=True)
+        return perform_detection_scan(
+            silent=True,
+            skip_lock=True,
+            force_fresh_capture=True,
+        )
     except Exception as e:
         # Silent errors for live scanning to avoid spam
         return None, 0
@@ -1569,17 +2259,22 @@ def toggle_overlay_switch(e, page_ref):
         e.control.update()
         return
     
-    if len(area) != 4:
-        log_message("[error] Set screen area first before enabling overlay", "error")
+    display_area = get_effective_game_area()
+    if len(display_area) != 4:
+        log_message("[error] Run a detection scan or set the screen area before enabling the overlay", "error")
         e.control.value = False
         e.control.update()
         return
     
     if e.control.value:
-        if manager.start_overlay(game_area=area):
-            log_message(f"[info] Detection overlay enabled at area {area}", "success")
+        if manager.start_overlay(game_area=display_area):
+            log_message(f"[info] Detection overlay enabled at area {display_area}", "success")
             if last_detection_results:
-                manager.update_detections_from_scan(last_detection_results, area, resize_factor)
+                manager.display_manual_snapshot(
+                    last_detection_results,
+                    display_area,
+                    resize_factor,
+                )
         else:
             e.control.value = False
             e.control.update()
@@ -1590,6 +2285,18 @@ def toggle_overlay_switch(e, page_ref):
             live_scan_switch_ref.current.value = False
             live_scan_switch_ref.current.update()
         log_message("[info] Detection overlay disabled", "info")
+
+
+def set_sort_strategy(strategy: str, page_ref):
+    """Set sort strategy and save config"""
+    global sort_strategy
+    sort_strategy = strategy
+    save_config()
+    log_message(f"[info] Sort strategy set to: {strategy.replace('_', ' ').title()}", "info")
+    try:
+        page_ref.update()
+    except:
+        pass
 
 
 def set_detection_mode(mode: str, page_ref, mode_ref, status_ref, tuning_ref):
@@ -1786,8 +2493,9 @@ def toggle_live_detection_button(e, page_ref):
         log_message("[error] Live detection not available", "error")
         return
     
-    if len(area) != 4:
-        log_message("[error] Set screen area first", "error")
+    display_area = get_effective_game_area()
+    if len(display_area) != 4:
+        log_message("[error] Run a detection scan or set the screen area first", "error")
         return
     
     # Check if already running
@@ -1808,16 +2516,16 @@ def toggle_live_detection_button(e, page_ref):
         ImageFinder.enable_motion_detection(True)
         
         # Start live detection
-        if not manager.start_overlay(game_area=area):
+        if not manager.start_overlay(game_area=display_area):
             log_message("[error] Failed to start overlay", "error")
             return
         
         manager.start_live_detection(
             scan_callable=_live_scan_callable,
-            scan_interval=0.2,  # Faster - 200ms updates (with frame skipping = 400ms effective)
+            scan_interval=0.12,  # Faster target cadence (~120ms) thanks to motion detection
             resize_factor=resize_factor,
         )
-        log_message("[info] Live detection started - optimized with motion detection & frame skipping", "success")
+        log_message("[info] Live detection started - optimized with motion detection & adaptive cadence", "success")
 
 
 def scan_board_button_callback():
@@ -1951,9 +2659,57 @@ start_button_callback = None
 stop_button_callback = None
 # Scan callbacks are defined below
 manual_select_slots_callback = None
-generate_sort_plan_callback = None
-run_sort_plan_callback = None
-# These are defined above in this file, not imported from gui.py
+def generate_sort_plan_callback(e=None):
+    """Callback for generate sort plan button"""
+    generate_auto_sort_plan()
+
+
+def run_sort_plan_callback(e=None):
+    """Callback for run sort plan button"""
+    global sort_plan
+    
+    if not sort_plan:
+        log_message("[warn] Generate a sort plan before running the sorter.")
+        return
+    
+    if len(area) != 4:
+        log_message("[error] Set the screen area before running the sorter.")
+        return
+    
+    log_message(f"[info] Executing auto sort plan with {len(sort_plan)} move(s).")
+    
+    slot_lookup = {slot["id"]: slot for slot in board_slots}
+    
+    for move in sort_plan:
+        source_center = move["source_center"]
+        target_center = move["target_center"]
+        
+        pyautogui.mouseUp()
+        pyautogui.moveTo(int(source_center[0]), int(source_center[1]))
+        pyautogui.mouseDown()
+        pyautogui.moveTo(
+            int(target_center[0]),
+            int(target_center[1]),
+            duration=drag_duration_seconds,
+        )
+        pyautogui.mouseUp()
+        time.sleep(0.05)
+        
+        log_message(f"[debug] Moved {move['item']} from {move['source_slot']} to {move['target_slot']}.")
+        
+        src_slot = slot_lookup.get(move["source_slot"])
+        dst_slot = slot_lookup.get(move["target_slot"])
+        
+        if src_slot:
+            src_slot["type"] = None
+            src_slot["detected_center"] = None
+        
+        if dst_slot:
+            dst_slot["type"] = move["item"]
+            dst_slot["detected_center"] = move["target_center"]
+    
+    log_message("[info] Auto sort plan completed.")
+    sort_plan = []
 
 # Global for detection results
 last_detection_results = {}
@@ -2782,7 +3538,7 @@ def create_flet_gui(page: ft.Page):
     )
     
     # Tab Buttons (will be created before tabs)
-    tab_names = ["Quick Start", "Detection", "Settings", "Activity", "Grid View", "Automation", "Tests"]
+    tab_names = ["Quick Start", "Detection", "Settings", "Activity", "Detection Map", "Automation", "Tests"]
     for i, name in enumerate(tab_names):
         def make_switch(idx):
             return lambda e: switch_tab(e, idx)
@@ -3331,6 +4087,64 @@ def create_flet_gui(page: ft.Page):
                     width=None,
                     color=PURPLE,
                 ),
+                ft.Container(height=16),
+                
+                # Sort Strategy Section
+                ft.Text("Sort Strategy", size=18, weight=ft.FontWeight.W_600, color=ACCENT_BLUE),
+                ft.Container(height=12),
+                ft.Row(
+                    controls=[
+                        create_glass_button(
+                            "Alphabetical",
+                            on_click=lambda e: set_sort_strategy("alphabetical", page),
+                            width=180,
+                            height=50,
+                            color=ACCENT_BLUE if sort_strategy == "alphabetical" else TEXT_MUTED,
+                        ),
+                        create_glass_button(
+                            "Merge Potential",
+                            on_click=lambda e: set_sort_strategy("merge_potential", page),
+                            width=180,
+                            height=50,
+                            color=PURPLE if sort_strategy == "merge_potential" else TEXT_MUTED,
+                        ),
+                    ],
+                    spacing=12,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                ),
+                ft.Container(height=8),
+                ft.Text(
+                    f"Current: {sort_strategy.replace('_', ' ').title()}",
+                    size=12,
+                    color=TEXT_SUBTLE,
+                    text_align=ft.TextAlign.CENTER,
+                ),
+                ft.Container(height=12),
+                ft.Row(
+                    controls=[
+                        create_glass_button(
+                            "Generate Sort Plan",
+                            on_click=generate_sort_plan_callback,
+                            width=None,
+                            color=ACCENT_BLUE,
+                        ),
+                        create_glass_button(
+                            "Execute Sort",
+                            on_click=run_sort_plan_callback,
+                            width=None,
+                            color=SUCCESS_GREEN,
+                        ),
+                    ],
+                    spacing=12,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                ),
+                ft.Container(height=8),
+                ft.Text(
+                    "Generate: Creates sorting plan | Execute: Runs the automated sorting",
+                    size=11,
+                    color=TEXT_SUBTLE,
+                    text_align=ft.TextAlign.CENTER,
+                ),
             ],
             spacing=16,
             expand=True,
@@ -3341,197 +4155,358 @@ def create_flet_gui(page: ft.Page):
         expand=True,
     )
     
-    # Grid View Helper Functions
-    def create_game_grid_view(detection_results, game_area, grid_size=(10, 10)):
-        """
-        Create a 2D grid visualization of detected objects.
-        
-        Args:
-            detection_results: Dict with template names and detected points
-            game_area: Tuple (start_x, start_y, end_x, end_y) of game area
-            grid_size: Tuple (rows, cols) for the grid
-        """
+    # Detection Map Helper Functions
+    detection_map_ref = ft.Ref[ft.Container]()
+    map_save_status_ref = ft.Ref[ft.Text]()
+
+    def create_detection_map_view(detection_results, game_area, preview_image=None):
+        """Render detections in their relative positions across the game area."""
+        if not detection_results:
+            return ft.Container(
+                content=ft.Text("No detections yet. Run a scan first.", color=TEXT_MUTED, size=14),
+                padding=20,
+                alignment=ft.alignment.center,
+            )
+
         if not game_area or len(game_area) != 4:
             return ft.Container(
-                content=ft.Text("Game area not set. Please select your game area first.", color=DANGER_RED, size=14),
+                content=ft.Text(
+                    "Game area missing. Configure it in Quick Start or run detection.",
+                    color=DANGER_RED,
+                    size=14,
+                    text_align=ft.TextAlign.CENTER,
+                ),
                 padding=20,
-                alignment=ft.alignment.center
             )
-        
+
+        entries = build_detection_map_entries(detection_results, game_area)
+        if not entries:
+            return ft.Container(
+                content=ft.Text("No detection points available.", color=TEXT_MUTED, size=14),
+                padding=20,
+                alignment=ft.alignment.center,
+            )
+
         start_x, start_y, end_x, end_y = game_area
-        width = end_x - start_x
-        height = end_y - start_y
-        rows, cols = grid_size
+        width = max(1, end_x - start_x)
+        height = max(1, end_y - start_y)
+        map_width = 520
+        aspect_ratio = height / width if width else 1
+        map_height = max(320, int(map_width * aspect_ratio))
+        marker_size = 22
+
+        stack_controls = [
+            ft.Container(
+                left=0,
+                top=0,
+                width=map_width,
+                height=map_height,
+                bgcolor=hex_with_opacity("#FFFFFF", 0.08),
+                border=ft.border.all(1, GLASS_BORDER),
+                border_radius=12,
+            )
+        ]
+
+        # Group entries by position to handle overlapping markers
+        position_groups = {}
+        for entry in entries:
+            # Round to grid to group nearby markers (within 10px)
+            grid_x = int(entry["normalized"]["x"] * map_width / 10) * 10
+            grid_y = int(entry["normalized"]["y"] * map_height / 10) * 10
+            key = (grid_x, grid_y)
+            if key not in position_groups:
+                position_groups[key] = []
+            position_groups[key].append(entry)
         
-        cell_width = width / cols
-        cell_height = height / rows
-        
-        # Create a grid map: (row, col) -> list of items
-        grid_map = {}
-        for r in range(rows):
-            for c in range(cols):
-                grid_map[(r, c)] = []
-        
-        # Map detected objects to grid cells
-        total_items = 0
-        for template_name, data in detection_results.items():
-            points = data.get('points', [])
-            item_name = os.path.splitext(template_name)[0]
-            template_path = data.get('template_path', '')
-            
-            for point in points:
-                px, py = point
-                # Convert to relative coordinates
-                rel_x = px - start_x
-                rel_y = py - start_y
+        marker_index = 0
+        for (grid_x, grid_y), group_entries in position_groups.items():
+            # If multiple detections at same position, show count
+            if len(group_entries) > 1:
+                # Show a larger marker with count
+                entry = group_entries[0]
+                left = entry["normalized"]["x"] * map_width - marker_size / 2
+                top = entry["normalized"]["y"] * map_height - marker_size / 2
+                left = max(0, min(map_width - marker_size, left))
+                top = max(0, min(map_height - marker_size, top))
                 
-                # Calculate grid position
-                col = min(cols - 1, max(0, int(rel_x / cell_width)))
-                row = min(rows - 1, max(0, int(rel_y / cell_height)))
+                marker = ft.Container(
+                    width=marker_size + 4,
+                    height=marker_size + 4,
+                    bgcolor=hex_with_opacity(entry["color"], 0.95),
+                    border=ft.border.all(2, hex_with_opacity("#FFFFFF", 0.8)),
+                    border_radius=(marker_size + 4) / 2,
+                    alignment=ft.alignment.center,
+                    tooltip=f"{len(group_entries)} items at ({entry['normalized']['x']:.2f}, {entry['normalized']['y']:.2f})",
+                    content=ft.Text(
+                        str(len(group_entries)),
+                        size=9,
+                        color=TEXT_PRIMARY,
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                )
+            else:
+                # Single detection
+                entry = group_entries[0]
+                marker_index += 1
+                left = entry["normalized"]["x"] * map_width - marker_size / 2
+                top = entry["normalized"]["y"] * map_height - marker_size / 2
+                left = max(0, min(map_width - marker_size, left))
+                top = max(0, min(map_height - marker_size, top))
                 
-                grid_map[(row, col)].append({
-                    "name": item_name,
-                    "pos": (px, py),
-                    "template": template_name,
-                    "template_path": template_path
-                })
-                total_items += 1
-        
-        # Build row-by-row
-        grid_rows = []
-        empty_count = 0
-        filled_count = 0
-        
-        for r in range(rows):
-            grid_cols = []
-            for c in range(cols):
-                items = grid_map[(r, c)]
-                
-                # Create cell widget
-                if items:
-                    filled_count += 1
-                    # Get the first item
-                    first_item = items[0]
-                    item_name = first_item["name"]
-                    template_path = first_item.get("template_path", "")
-                    
-                    # Determine cell color based on item count
-                    if len(items) > 1:
-                        cell_bg = ft.Colors.with_opacity(0.4, ft.Colors.ORANGE)
-                        border_color = ft.Colors.ORANGE_400
-                    else:
-                        cell_bg = ft.Colors.with_opacity(0.3, ft.Colors.GREEN)
-                        border_color = ft.Colors.GREEN_400
-                    
-                    # Create cell content
-                    cell_content_items = []
-                    
-                    # Try to show item image if exists
-                    if template_path and os.path.exists(template_path):
-                        cell_content_items.append(
-                            ft.Image(
-                                src=template_path,
-                                width=35,
-                                height=35,
-                                fit=ft.ImageFit.CONTAIN,
-                                error_content=ft.Text(item_name[:4], size=9, color=ft.Colors.WHITE)
-                            )
-                        )
-                    else:
-                        cell_content_items.append(
-                            ft.Text(item_name[:6], size=9, color=ft.Colors.WHITE, weight=ft.FontWeight.W_600)
-                        )
-                    
-                    # Show count if multiple items
-                    if len(items) > 1:
-                        cell_content_items.append(
-                            ft.Container(
-                                content=ft.Text(f"×{len(items)}", size=8, color=ft.Colors.YELLOW, weight=ft.FontWeight.BOLD),
-                                bgcolor=ft.Colors.with_opacity(0.7, ft.Colors.BLACK),
-                                padding=ft.padding.symmetric(horizontal=4, vertical=2),
-                                border_radius=4
-                            )
-                        )
-                    
-                    # Build tooltip text
-                    tooltip_text = f"Cell ({r},{c}): {item_name}"
-                    if len(items) > 1:
-                        other_items = [item["name"] for item in items[1:]]
-                        tooltip_text += f"\n+ {', '.join(other_items[:3])}"
-                        if len(items) > 4:
-                            tooltip_text += f"\n... and {len(items) - 4} more"
-                    
-                    cell = ft.Container(
-                        content=ft.Column(
-                            controls=cell_content_items,
-                            alignment=ft.MainAxisAlignment.CENTER,
-                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                            spacing=2
-                        ),
-                        width=50,
-                        height=50,
-                        bgcolor=cell_bg,
-                        border=ft.border.all(1, border_color),
-                        border_radius=5,
-                        tooltip=tooltip_text,
-                        padding=4
-                    )
-                else:
-                    empty_count += 1
-                    # Empty cell
-                    cell = ft.Container(
-                        content=ft.Text(f"{r},{c}", size=7, color=ft.Colors.with_opacity(0.3, ft.Colors.WHITE)),
-                        width=50,
-                        height=50,
-                        bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.WHITE),
-                        border=ft.border.all(1, ft.Colors.with_opacity(0.1, ft.Colors.WHITE)),
-                        border_radius=5,
-                        alignment=ft.alignment.center
-                    )
-                
-                grid_cols.append(cell)
-            
-            grid_rows.append(
-                ft.Row(
-                    controls=grid_cols,
-                    spacing=2,
-                    alignment=ft.MainAxisAlignment.START
+                marker = ft.Container(
+                    width=marker_size,
+                    height=marker_size,
+                    bgcolor=hex_with_opacity(entry["color"], 0.9),
+                    border=ft.border.all(2, hex_with_opacity("#FFFFFF", 0.6)),
+                    border_radius=marker_size / 2,
+                    alignment=ft.alignment.center,
+                    tooltip=f"{entry['display_name']} at ({entry['normalized']['x']:.2f}, {entry['normalized']['y']:.2f})",
+                    content=ft.Container(
+                        width=marker_size - 4,
+                        height=marker_size - 4,
+                        bgcolor=hex_with_opacity(entry["color"], 1.0),
+                        border_radius=(marker_size - 4) / 2,
+                    ),
+                )
+
+            stack_controls.append(
+                ft.Container(
+                    width=marker_size + 4 if len(group_entries) > 1 else marker_size,
+                    height=marker_size + 4 if len(group_entries) > 1 else marker_size,
+                    left=left,
+                    top=top,
+                    content=marker,
                 )
             )
-        
-        # Create stats row
-        stats_row = ft.Row(
-            controls=[
-                ft.Text(f"Grid: {rows}×{cols}", size=12, color=TEXT_PRIMARY),
-                ft.Text("•", size=12, color=TEXT_SUBTLE),
-                ft.Text(f"Filled: {filled_count}", size=12, color=SUCCESS_GREEN),
-                ft.Text("•", size=12, color=TEXT_SUBTLE),
-                ft.Text(f"Empty: {empty_count}", size=12, color=TEXT_MUTED),
-                ft.Text("•", size=12, color=TEXT_SUBTLE),
-                ft.Text(f"Total Items: {total_items}", size=12, color=ACCENT_BLUE),
-            ],
-            spacing=8,
-            alignment=ft.MainAxisAlignment.CENTER
+
+        map_canvas = ft.Container(
+            width=map_width,
+            height=map_height,
+            padding=12,
+            bgcolor=hex_with_opacity("#FFFFFF", 0.03),
+            border=ft.border.all(1, GLASS_BORDER),
+            border_radius=12,
+            clip_behavior=ft.ClipBehavior.HARD_EDGE,
+            content=ft.Stack(
+                controls=stack_controls,
+                expand=True,
+            ),
         )
+
+        # Group detections by type for better legend
+        type_groups = {}
+        for entry in entries:
+            display_name = entry["display_name"]
+            if display_name not in type_groups:
+                type_groups[display_name] = []
+            type_groups[display_name].append(entry)
         
-        return ft.Column(
-            controls=[
-                stats_row,
-                ft.Divider(height=1, color=GLASS_BORDER),
-                ft.Container(height=8),
+        # Create improved legend with grouped entries
+        legend_rows = []
+        for display_name in sorted(type_groups.keys()):
+            group_entries = type_groups[display_name]
+            count = len(group_entries)
+            color = group_entries[0]["color"]
+            
+            # Show type name with count
+            legend_rows.append(
                 ft.Container(
                     content=ft.Column(
-                        controls=grid_rows,
-                        spacing=2,
-                        scroll=ft.ScrollMode.AUTO
+                        controls=[
+                            ft.Row(
+                                controls=[
+                                    ft.Container(width=16, height=16, bgcolor=hex_with_opacity(color, 0.9), border_radius=8, border=ft.border.all(1, hex_with_opacity("#000000", 0.3))),
+                                    ft.Text(
+                                        f"{display_name}",
+                                        size=12,
+                                        color=TEXT_PRIMARY,
+                                        weight=ft.FontWeight.W_600,
+                                    ),
+                                    ft.Container(expand=True),
+                                    ft.Container(
+                                        content=ft.Text(
+                                            str(count),
+                                            size=11,
+                                            color=ACCENT_BLUE,
+                                            weight=ft.FontWeight.BOLD,
+                                        ),
+                                        padding=ft.padding.symmetric(horizontal=8, vertical=2),
+                                        bgcolor=hex_with_opacity(ACCENT_BLUE, 0.2),
+                                        border_radius=12,
+                                    ),
+                                ],
+                                spacing=8,
+                                tight=True,
+                            ),
+                        ],
+                        spacing=4,
+                        tight=True,
                     ),
-                    expand=True
+                    padding=ft.padding.symmetric(vertical=4, horizontal=8),
+                    border_radius=8,
+                    on_hover=lambda e, name=display_name, entries=group_entries: None,  # Could add hover highlight
                 )
-            ],
-            spacing=8,
-            expand=True
+            )
+
+        legend_panel = ft.Container(
+            width=280,
+            height=map_height,
+            bgcolor=hex_with_opacity("#FFFFFF", 0.04),
+            border=ft.border.all(1, GLASS_BORDER),
+            border_radius=12,
+            padding=12,
+            content=ft.Column(
+                controls=[
+                    ft.Row(
+                        controls=[
+                            ft.Text("Detection Types", size=14, color=TEXT_PRIMARY, weight=ft.FontWeight.W_600),
+                            ft.Container(expand=True),
+                            ft.Text(f"{len(entries)} total", size=11, color=TEXT_MUTED),
+                        ],
+                        spacing=8,
+                    ),
+                    ft.Divider(height=1, color=GLASS_BORDER),
+                    ft.ListView(controls=legend_rows, spacing=4, expand=True),
+                ],
+                spacing=8,
+                expand=True,
+            ),
         )
-    
+
+        type_count = len({entry["display_name"] for entry in entries})
+        summary_text = ft.Text(
+            f"{len(entries)} detections • {type_count} template types • area {width}px × {height}px",
+            size=12,
+            color=TEXT_MUTED,
+        )
+
+        controls = [summary_text]
+        if preview_image:
+            preview_card = ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.Text("Detection preview", size=14, color=TEXT_SUBTLE),
+                        ft.Image(
+                            src_base64=preview_image,
+                            width=map_width,
+                            fit=ft.ImageFit.CONTAIN,
+                            border_radius=12,
+                        ),
+                        ft.Text("Screenshot annotated with detected items", size=12, color=TEXT_MUTED),
+                    ],
+                    spacing=8,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                ),
+                padding=12,
+                bgcolor=hex_with_opacity("#000000", 0.25),
+                border=ft.border.all(1, GLASS_BORDER),
+                border_radius=12,
+            )
+            controls.append(preview_card)
+            controls.append(ft.Container(height=12))
+
+        controls.append(
+            ft.Row(
+                controls=[map_canvas, legend_panel],
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=16,
+                wrap=True,
+            )
+        )
+
+        return ft.Column(
+            controls=controls,
+            spacing=12,
+            expand=True,
+        )
+
+    def update_detection_map():
+        """Refresh detection map container with the latest scan results."""
+        global last_detection_results
+        if not detection_map_ref.current:
+            return
+
+        try:
+            if not last_detection_results:
+                detection_map_ref.current.content = create_glass_card(
+                    ft.Column(
+                        controls=[
+                            ft.Icon(ft.Icons.MAP_OUTLINED, color=TEXT_SUBTLE, size=48),
+                            ft.Text("No detection data available", color=TEXT_PRIMARY, size=16),
+                            ft.Text("Run a scan from the Detection tab first.", color=TEXT_MUTED, size=12),
+                            create_glass_button(
+                                "Go to Detection Tab",
+                                on_click=lambda e: switch_tab(e, 1),
+                                width=None,
+                                color=ACCENT_BLUE,
+                            ),
+                        ],
+                        spacing=10,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    padding=40,
+                )
+                detection_map_ref.current.update()
+                return
+
+            game_area = get_effective_game_area()
+            preview_image = None
+            if last_detection_results and len(game_area) == 4:
+                preview_image = _draw_boxes_on_screenshot(last_detection_results, game_area)
+            map_widget = create_detection_map_view(last_detection_results, game_area, preview_image)
+            detection_map_ref.current.content = create_glass_card(map_widget, padding=16)
+            detection_map_ref.current.update()
+            update_log("[info] Detection map updated.")
+        except Exception as ex:
+            update_log(f"[error] Failed to update detection map: {ex}")
+            detection_map_ref.current.content = create_glass_card(
+                ft.Text(f"Error updating map: {ex}", color=DANGER_RED, size=12),
+                padding=20,
+            )
+            detection_map_ref.current.update()
+
+    def scan_and_update_detection_map(e):
+        """Trigger detection scan and refresh the map when finished."""
+        update_log("[info] Running detection scan for map view...")
+        scan_and_preview_callback(page)
+
+        def delayed_update():
+            time.sleep(1.0)
+            update_detection_map()
+
+        threading.Thread(target=delayed_update, daemon=True).start()
+
+    def refresh_detection_map(e):
+        update_detection_map()
+
+    def save_detection_map(e):
+        """Persist the normalized detection coordinates to disk."""
+        global last_detection_results
+        game_area = get_effective_game_area()
+        file_path, error = save_detection_map_snapshot(last_detection_results, game_area)
+        if map_save_status_ref.current:
+            if error:
+                map_save_status_ref.current.value = error
+                map_save_status_ref.current.color = DANGER_RED
+            else:
+                try:
+                    relative = os.path.relpath(file_path, BASE_DIR.parent)
+                except Exception:
+                    relative = file_path
+                map_save_status_ref.current.value = f"Saved snapshot to {relative}"
+                map_save_status_ref.current.color = SUCCESS_GREEN
+            map_save_status_ref.current.update()
+        if error:
+            log_message(f"[error] {error}")
+        else:
+            log_message(f"[info] Detection map saved to {file_path}")
+
+    global detection_map_refresh_handler, resize_factor_input_ref, resize_factor_button_ref
+    detection_map_refresh_handler = update_detection_map
+    resize_factor_input_ref = ft.Ref[ft.TextField]()
+    resize_factor_button_ref = ft.Ref[ft.TextButton]()
+
     # Tab 3: Settings (placeholder)
     settings_tab = ft.Container(
         content=ft.Column(
@@ -3558,6 +4533,54 @@ def create_flet_gui(page: ft.Page):
                     expand=True,
                 ),
                 ft.Container(height=24),
+                ft.Text("Image scale & zoom", size=18, weight=ft.FontWeight.W_600, color=ACCENT_BLUE),
+                ft.Text(
+                    "Match this setting to your in-game zoom. Auto detect helps when you zoom the board.",
+                    size=12,
+                    color=TEXT_MUTED,
+                ),
+                ft.Container(height=8),
+                ft.Row(
+                    controls=[
+                        ft.Container(
+                            content=ft.Column(
+                                controls=[
+                                    ft.Text("Current scale", size=12, color=TEXT_SUBTLE),
+                                    ft.TextField(
+                                        ref=resize_factor_input_ref,
+                                        value=f"{resize_factor:.2f}",
+                                        width=160,
+                                        text_align=ft.TextAlign.CENTER,
+                                        border_radius=ft.border_radius.all(12),
+                                        bgcolor=hex_with_opacity("#FFFFFF", 0.12),
+                                        color=TEXT_PRIMARY,
+                                        on_submit=update_resize_factor_from_input,
+                                    ),
+                                ],
+                                spacing=6,
+                            ),
+                            padding=ft.padding.all(4),
+                            bgcolor=hex_with_opacity("#000000", 0.1),
+                            border=ft.border.all(1, hex_with_opacity("#FFFFFF", 0.12)),
+                            border_radius=ft.border_radius.all(16),
+                            expand=True,
+                        ),
+                        ft.Container(
+                            content=ft.TextButton(
+                                "Auto detect scale",
+                                on_click=auto_calculate_resize_factor,
+                                ref=resize_factor_button_ref,
+                            ),
+                            padding=ft.padding.symmetric(horizontal=12, vertical=4),
+                            bgcolor=hex_with_opacity("#000000", 0.1),
+                            border=ft.border.all(1, hex_with_opacity("#FFFFFF", 0.12)),
+                            border_radius=ft.border_radius.all(16),
+                        ),
+                    ],
+                    spacing=12,
+                    expand=True,
+                ),
+                ft.Container(height=16),
                 ft.Text("Quick Collection", size=18, weight=ft.FontWeight.W_600, color=ACCENT_BLUE),
                 ft.Row(
                     controls=[
@@ -3639,255 +4662,95 @@ def create_flet_gui(page: ft.Page):
         expand=True,
     )
     
-    # Tab 5: Grid View (2D Visualization)
-    grid_view_ref = ft.Ref[ft.Container]()
-    grid_size_rows_ref = ft.Ref[ft.TextField]()
-    grid_size_cols_ref = ft.Ref[ft.TextField]()
-    
-    def update_grid_view():
-        """Refresh the grid visualization with current detection results"""
-        global last_detection_results, area, board_rows, board_cols
-        
-        try:
-            if not last_detection_results:
-                grid_view_ref.current.content = create_glass_card(
-                    ft.Column(
-                        controls=[
-                            ft.Icon(ft.Icons.INFO_OUTLINE, color=WARNING_ORANGE, size=48),
-                            ft.Container(height=16),
-                            ft.Text("No detection data available", size=16, color=TEXT_PRIMARY, weight=ft.FontWeight.W_600),
-                            ft.Text("Run a scan from the Detection tab first", size=13, color=TEXT_MUTED),
-                            ft.Container(height=16),
-                            create_glass_button(
-                                "Go to Detection Tab",
-                                on_click=lambda e: switch_tab(e, 1),  # Switch to Detection tab
-                                width=None,
-                                color=ACCENT_BLUE
-                            )
-                        ],
-                        alignment=ft.MainAxisAlignment.CENTER,
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                        spacing=8
-                    ),
-                    padding=40
-                )
-                grid_view_ref.current.update()
-                return
-            
-            rows = int(grid_size_rows_ref.current.value or board_rows)
-            cols = int(grid_size_cols_ref.current.value or board_cols)
-            
-            # Validate grid size
-            if rows <= 0 or cols <= 0 or rows > 20 or cols > 20:
-                grid_view_ref.current.content = create_glass_card(
-                    ft.Text("Invalid grid size. Please enter values between 1 and 20.", color=DANGER_RED, size=14),
-                    padding=20
-                )
-                grid_view_ref.current.update()
-                return
-            
-            # Create the grid widget
-            grid_widget = create_game_grid_view(
-                last_detection_results, 
-                area, 
-                grid_size=(rows, cols)
-            )
-            
-            grid_view_ref.current.content = create_glass_card(grid_widget, padding=16)
-            grid_view_ref.current.update()
-            
-            update_log(f"[info] Grid view updated: {rows}×{cols} grid")
-        except Exception as ex:
-            update_log(f"[error] Failed to update grid view: {ex}")
-            grid_view_ref.current.content = create_glass_card(
-                ft.Text(f"Error: {str(ex)}", color=DANGER_RED, size=12),
-                padding=20
-            )
-            grid_view_ref.current.update()
-    
-    def scan_and_update_grid(e):
-        """Run detection scan and update grid view"""
-        update_log("[info] Running detection scan for grid view...")
-        # Trigger detection scan
-        scan_and_preview_callback(page)
-        # Wait a moment for scan to complete, then update grid
-        import threading
-        def delayed_update():
-            time.sleep(0.5)
-            update_grid_view()
-        threading.Thread(target=delayed_update, daemon=True).start()
-    
-    grid_view_tab = ft.Container(
+    # Tab 5: Detection Map
+    detection_map_tab = ft.Container(
         content=ft.Column(
             controls=[
-                # Header
                 ft.Row(
                     controls=[
-                        ft.Text("2D Game Grid", size=24, weight=ft.FontWeight.W_700, color=PURPLE),
-                        ft.Icon(ft.Icons.GRID_VIEW, color=PURPLE, size=32),
+                        ft.Text("Detection Map", size=24, weight=ft.FontWeight.W_700, color=PURPLE),
+                        ft.Icon(ft.Icons.MAP, color=PURPLE, size=32),
                     ],
                     alignment=ft.MainAxisAlignment.CENTER,
-                    spacing=12
+                    spacing=12,
                 ),
-                ft.Text(
-                    "Visual representation of detected objects in grid coordinates",
-                    size=13,
-                    color=TEXT_MUTED,
-                    text_align=ft.TextAlign.CENTER
-                ),
+                ft.Text("View every detected item in its live position and export the snapshot for mapping.", size=13, color=TEXT_MUTED, text_align=ft.TextAlign.CENTER),
                 ft.Divider(height=1, color=GLASS_BORDER),
                 ft.Container(height=8),
-                
-                # Controls
                 create_glass_card(
                     ft.Column(
                         controls=[
-                            ft.Text("Grid Configuration", size=16, weight=ft.FontWeight.W_600, color=TEXT_PRIMARY),
+                            ft.Text("Workflow", size=16, weight=ft.FontWeight.W_600, color=TEXT_PRIMARY),
+                            ft.Text("Run a scan to populate the map, refresh to reuse the latest data, or save the normalized coordinates for later mapping.", size=12, color=TEXT_MUTED, text_align=ft.TextAlign.CENTER),
                             ft.Container(height=8),
                             ft.Row(
                                 controls=[
-                                    ft.Container(
-                                        content=ft.Column(
-                                            controls=[
-                                                ft.Text("Rows", size=12, color=TEXT_MUTED),
-                                                ft.TextField(
-                                                    ref=grid_size_rows_ref,
-                                                    value=str(board_rows),
-                                                    width=80,
-                                                    text_align=ft.TextAlign.CENTER,
-                                                    bgcolor=hex_with_opacity("#FFFFFF", 0.1),
-                                                    border_color=GLASS_BORDER,
-                                                    focused_border_color=ACCENT_BLUE,
-                                                    text_size=14,
-                                                    height=45
-                                                ),
-                                            ],
-                                            spacing=4,
-                                            horizontal_alignment=ft.CrossAxisAlignment.CENTER
-                                        ),
-                                        expand=False
-                                    ),
-                                    ft.Text("×", size=20, color=TEXT_SUBTLE),
-                                    ft.Container(
-                                        content=ft.Column(
-                                            controls=[
-                                                ft.Text("Columns", size=12, color=TEXT_MUTED),
-                                                ft.TextField(
-                                                    ref=grid_size_cols_ref,
-                                                    value=str(board_cols),
-                                                    width=80,
-                                                    text_align=ft.TextAlign.CENTER,
-                                                    bgcolor=hex_with_opacity("#FFFFFF", 0.1),
-                                                    border_color=GLASS_BORDER,
-                                                    focused_border_color=ACCENT_BLUE,
-                                                    text_size=14,
-                                                    height=45
-                                                ),
-                                            ],
-                                            spacing=4,
-                                            horizontal_alignment=ft.CrossAxisAlignment.CENTER
-                                        ),
-                                        expand=False
-                                    ),
-                                    ft.Container(width=16),
                                     create_glass_button(
-                                        "Update Grid",
-                                        on_click=lambda e: update_grid_view(),
-                                        width=140,
-                                        icon=ft.Icons.REFRESH,
-                                        color=ACCENT_BLUE
-                                    ),
-                                    create_glass_button(
-                                        "Scan & Update",
-                                        on_click=scan_and_update_grid,
-                                        width=140,
+                                        "Scan & Update Map",
+                                        on_click=scan_and_update_detection_map,
+                                        width=180,
                                         icon=ft.Icons.SEARCH,
-                                        color=SUCCESS_GREEN
+                                        color=SUCCESS_GREEN,
+                                    ),
+                                    create_glass_button(
+                                        "Refresh Last Scan",
+                                        on_click=refresh_detection_map,
+                                        width=180,
+                                        icon=ft.Icons.REFRESH,
+                                        color=PURPLE,
+                                    ),
+                                    create_glass_button(
+                                        "Save Detection Map",
+                                        on_click=save_detection_map,
+                                        width=200,
+                                        icon=ft.Icons.SAVE,
+                                        color=ACCENT_BLUE,
                                     ),
                                 ],
                                 alignment=ft.MainAxisAlignment.CENTER,
                                 spacing=12,
-                                wrap=True
+                                wrap=True,
+                            ),
+                            ft.Text(
+                                "No snapshot saved yet",
+                                size=12,
+                                color=TEXT_SUBTLE,
+                                ref=map_save_status_ref,
                             ),
                         ],
-                        spacing=8
+                        spacing=8,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
-                    padding=16
+                    padding=16,
                 ),
-                
                 ft.Container(height=8),
-                
-                # Grid view container
                 ft.Container(
-                    ref=grid_view_ref,
+                    ref=detection_map_ref,
                     content=create_glass_card(
                         ft.Column(
                             controls=[
-                                ft.Icon(ft.Icons.GRID_ON, color=TEXT_SUBTLE, size=64),
+                                ft.Icon(ft.Icons.MAP_OUTLINED, color=TEXT_SUBTLE, size=64),
                                 ft.Container(height=16),
-                                ft.Text("Click 'Update Grid' to visualize detected objects", size=14, color=TEXT_MUTED),
-                                ft.Text("or 'Scan & Update' to run a fresh detection scan", size=12, color=TEXT_SUBTLE),
+                                ft.Text("Click 'Refresh' after a scan to show detections", size=14, color=TEXT_MUTED),
+                                ft.Text("or 'Scan & Update' to run detection now", size=12, color=TEXT_SUBTLE),
                             ],
                             alignment=ft.MainAxisAlignment.CENTER,
                             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                            spacing=8
+                            spacing=8,
                         ),
-                        padding=40
+                        padding=40,
                     ),
-                    expand=True
-                ),
-                
-                # Legend
-                ft.Container(height=8),
-                create_glass_card(
-                    ft.Row(
-                        controls=[
-                            ft.Text("Legend:", size=12, color=TEXT_PRIMARY, weight=ft.FontWeight.W_600),
-                            ft.Container(
-                                content=ft.Text("Green", size=10, color=ft.Colors.WHITE),
-                                bgcolor=ft.Colors.with_opacity(0.3, ft.Colors.GREEN),
-                                padding=ft.padding.symmetric(horizontal=8, vertical=4),
-                                border_radius=4,
-                                border=ft.border.all(1, ft.Colors.GREEN_400)
-                            ),
-                            ft.Text("= Single item", size=11, color=TEXT_MUTED),
-                            ft.Container(width=8),
-                            ft.Container(
-                                content=ft.Text("Orange", size=10, color=ft.Colors.WHITE),
-                                bgcolor=ft.Colors.with_opacity(0.4, ft.Colors.ORANGE),
-                                padding=ft.padding.symmetric(horizontal=8, vertical=4),
-                                border_radius=4,
-                                border=ft.border.all(1, ft.Colors.ORANGE_400)
-                            ),
-                            ft.Text("= Multiple items", size=11, color=TEXT_MUTED),
-                            ft.Container(width=8),
-                            ft.Container(
-                                content=ft.Text("Gray", size=10, color=ft.Colors.with_opacity(0.5, ft.Colors.WHITE)),
-                                bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.WHITE),
-                                padding=ft.padding.symmetric(horizontal=8, vertical=4),
-                                border_radius=4,
-                                border=ft.border.all(1, ft.Colors.with_opacity(0.2, ft.Colors.WHITE))
-                            ),
-                            ft.Text("= Empty cell", size=11, color=TEXT_MUTED),
-                        ],
-                        alignment=ft.MainAxisAlignment.CENTER,
-                        spacing=8,
-                        wrap=True
-                    ),
-                    padding=12
                 ),
             ],
-            spacing=12,
-            scroll=ft.ScrollMode.AUTO,
-            expand=True
+            spacing=16,
+            expand=True,
         ),
         padding=20,
         visible=False,
         expand=True,
     )
-    
-    # Add tabs to containers list (must be after tabs are defined)
-    tab_containers.extend([quick_start_tab, detection_tab, settings_tab, activity_tab, grid_view_tab])
+
+    tab_containers.extend([quick_start_tab, detection_tab, settings_tab, activity_tab, detection_map_tab])
     
     # Add Automation and Tests tabs if available
     automation_orchestrator_ref = [None]  # Use list to allow modification
@@ -3978,6 +4841,7 @@ def create_flet_gui(page: ft.Page):
                     update_resource_display(res_type)
                 except:
                     pass
+        refresh_resize_factor_field()
     
     # Initialize live detection manager (will be initialized with game area when needed)
     global live_detection_manager

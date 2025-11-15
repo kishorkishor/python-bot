@@ -22,6 +22,7 @@ This guide captures everything the current tool already delivers, the shortcuts 
 - Capture the **Select counter area** after setting boxes to keep OCR in sync; hit Clear to fall back to manual input instantly.
 
 - Hit **`Auto calculate`** before scanning; `ImageFinder.find_best_resize_factor` sweeps 0.8-2.0 zoom to tighten match confidence without hand-tuning.
+- In the Flet GUI, open **Settings → Image scale & zoom** and hit **Auto detect scale** after changing zoom; it runs the same sweep to keep detections reliable on any board size.
 - Use **Advanced -> Auto Scan** immediately after setting the playfield; it backfills slot metadata and flags duplicates, making the generated plan more accurate.
 - Toggle **Manual Select** when auto-scan misses diagonally stacked items; once recorded, overrides persist via autosave.
 - Keep an eye on the **log header icons**: `[info]` vs `[warn]` call-outs show up in real time and trigger box depletion failsafes.
